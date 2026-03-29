@@ -21,14 +21,20 @@ GRADE_NAME = "3루 응원단석"      # 등급 이름
 TARGET_SECTION = "118"           # 우선 선택할 구역 (117, 118, 119 중)
 SEAT_COUNT = 3                   # 연속 좌석 수
 OPEN_TIME = "11:00:00"           # 판매 오픈 시간
+NEXT_BTN_POS = (908, 920)        # 다음단계 버튼 고정 좌표
+ASSIST_MODE = "--assist" in sys.argv  # 어시스트 모드: 사용자 1클릭 → 옆자리 자동
 
-# 좌석 색상 (RGB)
-target_color = (68, 87, 101)
-tolerance = 15
+# 좌석 색상 (RGB) — JS 스캔용
+SEAT_COLOR = (68, 87, 101)
+SEAT_TOLERANCE = 15
+MIN_SEAT_PIXELS = 18   # min_seat_size² * 0.5
+MAX_SEAT_SPAN = 50     # max_seat_size * 2
+
+# 좌석 색상 — pyautogui 스캔용 (하위호환)
+target_color = SEAT_COLOR
+tolerance = SEAT_TOLERANCE
 min_seat_size = 6
 max_seat_size = 25
-
-# 좌석 지도 영역 (구역 클릭 후 초기 위치 기준 — 필요시 coord_picker.py로 재측정)
 region = (273, 416, 188, 389)
 
 # OCR 엔진 미리 로딩 (캡차 인식용)
@@ -157,11 +163,11 @@ mouse_controller = mouse.Controller()
 
 def click_at(x, y):
     mouse_controller.position = (x - 5, y)
-    time.sleep(0.02)
+    time.sleep(0.01)
     mouse_controller.position = (x, y)
-    time.sleep(0.08)
+    time.sleep(0.03)
     mouse_controller.press(mouse.Button.left)
-    time.sleep(0.02)
+    time.sleep(0.01)
     mouse_controller.release(mouse.Button.left)
 
 
@@ -254,11 +260,55 @@ def _find_captcha_tab():
     return rw, rt
 
 
+def _ascii_only(text):
+    """ASCII 영문+숫자만 남기고 대문자"""
+    return ''.join(c for c in text if c.isascii() and c.isalnum()).upper()[:5]
+
 def ocr_captcha(img_bytes):
-    """캡차 이미지 OCR (ddddocr — 즉시 인식)"""
-    text = _ocr.classification(img_bytes)
-    text = ''.join(c for c in text if c.isalpha()).upper()[:5]
-    return text
+    """캡차 이미지 OCR (ddddocr) — 여러 전처리 시도, 5글자 우선"""
+    from PIL import Image, ImageEnhance, ImageFilter
+    import io
+
+    results = []
+
+    # 1차: 원본
+    t1 = _ascii_only(_ocr.classification(img_bytes))
+    results.append(t1)
+    if len(t1) == 5:
+        return t1
+
+    img_orig = Image.open(io.BytesIO(img_bytes))
+
+    # 2차: 그레이스케일 + 대비 1.5x
+    img = img_orig.convert('L')
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    buf = io.BytesIO(); img.save(buf, format='PNG')
+    t2 = _ascii_only(_ocr.classification(buf.getvalue()))
+    results.append(t2)
+    if len(t2) == 5:
+        return t2
+
+    # 3차: 그레이스케일 + 대비 2.0x + 샤프닝
+    img = img_orig.convert('L')
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+    buf = io.BytesIO(); img.save(buf, format='PNG')
+    t3 = _ascii_only(_ocr.classification(buf.getvalue()))
+    results.append(t3)
+    if len(t3) == 5:
+        return t3
+
+    # 4차: 이진화 (threshold 100, 더 관대)
+    img = img_orig.convert('L')
+    img = img.point(lambda x: 0 if x < 100 else 255)
+    buf = io.BytesIO(); img.save(buf, format='PNG')
+    t4 = _ascii_only(_ocr.classification(buf.getvalue()))
+    results.append(t4)
+    if len(t4) == 5:
+        return t4
+
+    # 5글자 없으면 가장 긴 결과 반환
+    return max(results, key=len)
 
 
 def _captcha_get_image_and_key(rw, rt):
@@ -267,7 +317,7 @@ def _captcha_get_image_and_key(rw, rt):
     try {
         var r = {};
         var c = document.getElementById('captcha_canvas');
-        if (c && c.width > 0) r.img = c.toDataURL('image/jpeg', 0.3);
+        if (c && c.width > 0) r.img = c.toDataURL('image/png');
         try { r.key = angular.element(document.body).injector().get('captcha').captchaKey; } catch(e) {}
         document.getElementById('__mr').setAttribute('data-r', JSON.stringify(r));
     } catch(e) {
@@ -389,10 +439,10 @@ def solve_captcha():
             print("  이미지 가져오기 실패")
             continue
 
-        # 2. OCR
+        # 2. OCR (5글자 아니면 바로 새로고침)
         text = ocr_captcha(img_bytes)
-        if not text or len(text) < 3:
-            print(f"  OCR 실패: '{text}'")
+        if not text or len(text) != 5:
+            print(f"  OCR 불완전: '{text}' ({len(text) if text else 0}자) → 새로고침")
             continue
 
         print(f"  OCR: {text} ({(time.time()-t0)*1000:.0f}ms)")
@@ -560,13 +610,13 @@ def phase2_select_grade_and_section():
     if sw > 0:
         # 예매하기 클릭 후 같은 탭에서 reserve/plan/schedule로 전환됨
         # URL 변경 감지
-        for attempt in range(20):
+        for attempt in range(60):
             url = _run_js("location.href;", sw, st)
             if "reserve/plan/schedule" in url:
                 print(f"  좌석 선택 페이지 전환 확인: window {sw}, tab {st}")
                 rw, rt = sw, st
                 break
-            time.sleep(0.5)
+            time.sleep(0.1)
         else:
             # 혹시 새 창으로 열렸을 수도 있으니 확인
             rw, rt = find_ticketlink_window()
@@ -576,18 +626,25 @@ def phase2_select_grade_and_section():
             print(f"  좌석 선택 페이지 (새 창): window {rw}, tab {rt}")
     else:
         # 스케줄 탭이 사라졌으면 이미 전환된 것 → 예매 페이지 찾기
-        for attempt in range(20):
+        for attempt in range(60):
             rw, rt = find_ticketlink_window()
             if rw > 0:
                 print(f"  좌석 선택 페이지 발견: window {rw}, tab {rt}")
                 break
-            time.sleep(0.5)
+            time.sleep(0.1)
         else:
             print("  좌석 선택 페이지를 찾을 수 없습니다!")
             return False
 
-    # 페이지 로딩 대기
-    time.sleep(2)
+    # 등급 목록 로딩 대기 (polling)
+    for _ in range(60):
+        count = _run_js("document.querySelectorAll('[ng-click*=\"select.select\"]').length;", rw, rt)
+        if count and int(count) > 0:
+            break
+        time.sleep(0.05)
+    else:
+        print("  등급 목록 로딩 타임아웃")
+        return False
 
     # 등급 클릭 (run_direct_js 사용 — run_page_js의 base64/atob는 한글 깨짐)
     js_grade = f'''
@@ -607,7 +664,12 @@ def phase2_select_grade_and_section():
     if not result.startswith("grade_clicked"):
         return False
 
-    time.sleep(1)
+    # 구역 로딩 대기 (polling)
+    for _ in range(40):
+        count = _run_js("document.querySelectorAll('[ng-click*=\"grade.select\"]').length;", rw, rt)
+        if count and int(count) > 0:
+            break
+        time.sleep(0.05)
 
     # 타겟 구역(118) 우선 선택 — 구역은 ng-click="grade.select(...)"
     js_section = f'''
@@ -640,7 +702,7 @@ def phase2_select_grade_and_section():
         print("  빈 구역이 없습니다!")
         return False
 
-    time.sleep(0.5)
+    time.sleep(0.1)
 
     # 직접선택 팝업이 뜨면 클릭
     js_direct = '''
@@ -677,44 +739,198 @@ end tell'''
         f.flush()
         subprocess.run(["osascript", f.name], capture_output=True, timeout=5)
         os.unlink(f.name)
-    time.sleep(0.3)
+    time.sleep(0.15)
 
 
-def phase3_scan_and_click():
-    """좌석 스캔 → 연속 3자리 클릭"""
-    # Chrome을 앞으로 가져와야 pynput 클릭이 캔버스에 닿음
-    _bring_chrome_front()
+def _get_canvas_region():
+    """캔버스의 화면 좌표를 JS로 동적으로 가져오기"""
+    rw, rt = find_ticketlink_window()
+    if rw == 0:
+        rw, rt = find_any_ticketlink()
+    if rw == 0:
+        return None
+    result = run_direct_js('''
+    (function() {
+        var canvases = document.querySelectorAll('#main_view canvas');
+        for (var i = canvases.length - 1; i >= 0; i--) {
+            var c = canvases[i];
+            if (c.style.display !== 'none' && c.width > 100) {
+                var r = c.getBoundingClientRect();
+                var tb = window.outerHeight - window.innerHeight;
+                return JSON.stringify({
+                    x: Math.round(window.screenX + r.left),
+                    y: Math.round(window.screenY + tb + r.top),
+                    w: Math.round(r.width),
+                    h: Math.round(r.height)
+                });
+            }
+        }
+        return 'not_found';
+    })();
+    ''', rw, rt)
+    if not result or result == 'not_found':
+        return None
+    import json as _json
+    r = _json.loads(result)
+    return (r['x'], r['y'], r['w'], r['h'])
 
-    print(f"\n  스캔 중... region={region}")
-    screenshot = pyautogui.screenshot(region=region)
+
+def phase3_scan_and_click(cached_region=None):
+    """자동 모드: pyautogui 스크린샷 + 좌석 스캔"""
+    t0 = time.time()
+    canvas_region = cached_region or region
+
+    screenshot = pyautogui.screenshot(region=canvas_region)
     img = np.array(screenshot.convert("RGB"))
+    t1 = time.time()
 
     seats = find_seats(img)
-    print(f"  발견된 좌석: {len(seats)}개")
+    t2 = time.time()
+    print(f"  좌석 {len(seats)}개 (캡처:{(t1-t0)*1000:.0f}ms 스캔:{(t2-t1)*1000:.0f}ms)")
 
     if not seats:
         return False
 
     consecutive = find_consecutive_seats(seats, SEAT_COUNT)
     to_click = None
-
     if consecutive:
         print(f"  연속 {SEAT_COUNT}자리 발견!")
         to_click = consecutive
     elif len(seats) >= SEAT_COUNT:
-        print(f"  연속 없음, 가장 가까운 {SEAT_COUNT}자리...")
         seats.sort(key=lambda s: (s['cy'], s['cx']))
         to_click = seats[:SEAT_COUNT]
 
-    if to_click:
-        for i, seat in enumerate(to_click):
-            real_x = region[0] + seat['cx']
-            real_y = region[1] + seat['cy']
-            click_at(real_x, real_y)
-            print(f"  좌석 {i+1}: ({real_x}, {real_y})")
-            time.sleep(0.3)
-        return True
-    return False
+    if not to_click:
+        return False
+
+    for i, seat in enumerate(to_click):
+        real_x = canvas_region[0] + seat['cx']
+        real_y = canvas_region[1] + seat['cy']
+        click_at(real_x, real_y)
+        print(f"  좌석 {i+1}: ({real_x}, {real_y})")
+        time.sleep(0.25)
+
+    # 즉시 다음단계
+    time.sleep(0.25)
+    click_at(NEXT_BTN_POS[0], NEXT_BTN_POS[1])
+    print(f"  다음단계 즉시 클릭! {NEXT_BTN_POS}")
+    return True
+
+
+def phase3_assist_mode():
+    """어시스트 모드: 사용자가 1석 클릭 → 옆 2석 자동 클릭 → 즉시 다음단계
+    JS polling 없이 순수 마우스 클릭 감지만 사용"""
+    import threading
+
+    click_pos = [None]
+    click_event = threading.Event()
+
+    def on_click(x, y, button, pressed):
+        if pressed and button == mouse.Button.left:
+            click_pos[0] = (x, y)
+            click_event.set()
+
+    listener = mouse.Listener(on_click=on_click)
+    listener.start()
+
+    print("  좌석 1개를 클릭하세요... (캔버스 영역 감지 중)")
+    t0 = time.time()
+
+    # 사용자 클릭 대기 (최대 60초)
+    if not click_event.wait(timeout=60):
+        listener.stop()
+        print("  타임아웃 (60초)")
+        return False
+
+    user_x, user_y = click_pos[0]
+    print(f"  클릭 감지! ({user_x},{user_y}) {(time.time()-t0)*1000:.0f}ms")
+
+    # 좌석 등록 + 캔버스 렌더링 대기
+    time.sleep(0.5)
+
+    # 클릭 위치 주변 미니 스캔 (사용자 좌석은 이미 색 변경됨)
+    scan_w, scan_h = 400, 50
+    mini_x = max(0, user_x - 20)
+    mini_y = max(0, user_y - scan_h // 2)
+
+    screenshot = pyautogui.screenshot(region=(mini_x, mini_y, scan_w, scan_h))
+    img = np.array(screenshot.convert("RGB"))
+    seats = find_seats(img)
+
+    user_local_x = user_x - mini_x
+    user_local_y = user_y - mini_y
+
+    # 같은 행에서 사용자 클릭 위치 제외 (±15px) → 오른쪽 우선
+    right = [s for s in seats
+             if abs(s['cy'] - user_local_y) <= 8 and s['cx'] > user_local_x + 15]
+    right.sort(key=lambda s: s['cx'])
+
+    # 오른쪽 부족하면 왼쪽도
+    left = [s for s in seats
+            if abs(s['cy'] - user_local_y) <= 8 and s['cx'] < user_local_x - 15]
+    left.sort(key=lambda s: -s['cx'])  # 가까운 순
+
+    to_click = right[:SEAT_COUNT - 1]
+    if len(to_click) < SEAT_COUNT - 1:
+        to_click += left[:SEAT_COUNT - 1 - len(to_click)]
+
+    clicked = 0
+    for s in to_click:
+        rx = mini_x + s['cx']
+        ry = mini_y + s['cy']
+        click_at(rx, ry)
+        clicked += 1
+        print(f"  자동 좌석 {clicked+1}: ({rx},{ry})")
+        time.sleep(0.1)
+
+    listener.stop()
+
+    if clicked < SEAT_COUNT - 1:
+        print(f"  옆자리 부족 ({clicked}석만 추가)")
+        return False
+
+    # 검증
+    time.sleep(0.3)
+    count = _verify_seat_selection()
+    print(f"  검증: {count}석 선택됨")
+    if count < SEAT_COUNT:
+        print(f"  부족! 수동으로 추가 후 다음단계를 눌러주세요.")
+        return False
+
+    print(f"  {count}석 완료! {(time.time()-t0)*1000:.0f}ms")
+
+    # 즉시 다음단계 클릭
+    time.sleep(0.05)
+    rw, rt = find_ticketlink_window()
+    if rw == 0:
+        rw, rt = find_any_ticketlink()
+    if rw > 0:
+        js_btn = '''
+        (function() {
+            var btns = document.querySelectorAll('button, a, input[type="button"]');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText || btns[i].value || '').trim();
+                if (t === '다음단계' || t === '다음 단계') {
+                    var rect = btns[i].getBoundingClientRect();
+                    if (rect.width > 0) {
+                        var tb = window.outerHeight - window.innerHeight;
+                        return JSON.stringify({
+                            sx: Math.round(window.screenX + rect.left + rect.width/2),
+                            sy: Math.round(window.screenY + tb + rect.top + rect.height/2)
+                        });
+                    }
+                }
+            }
+            return 'not_found';
+        })();
+        '''
+        result = run_direct_js(js_btn, rw, rt)
+        if result and result != 'not_found':
+            import json as _json
+            pos = _json.loads(result)
+            click_at(pos['sx'], pos['sy'])
+            print(f"  다음단계 즉시 클릭! ({pos['sx']},{pos['sy']}) {(time.time()-t0)*1000:.0f}ms")
+    return True
 
 
 def _verify_seat_selection():
@@ -829,12 +1045,13 @@ def wait_for_open_time():
         print("\n  대기 취소! 바로 시작합니다.")
 
 
-def run_full():
+def run_full(skip_wait=False):
     """전체 플로우 실행"""
-    print("\n" + "=" * 50)
-    print("  Phase 0: 오픈 시간 대기")
-    print("=" * 50)
-    wait_for_open_time()
+    if not skip_wait:
+        print("\n" + "=" * 50)
+        print("  Phase 0: 오픈 시간 대기")
+        print("=" * 50)
+        wait_for_open_time()
 
     t_start = time.time()
 
@@ -862,6 +1079,7 @@ def run_full():
     print("\n" + "=" * 50)
     print("  Phase 1.5: 보안문자 확인")
     print("=" * 50)
+    time.sleep(1)
     rw, rt = _find_captcha_tab()
     if rw > 0:
         check_js = '''
@@ -896,31 +1114,76 @@ def run_full():
         print("  등급/구역 선택 실패. 종료.")
         return
 
-    # 좌석 지도 로딩 대기
+    # 좌석 지도 로딩 대기 (canvas 감지 polling)
     print("  좌석 지도 로딩 대기...")
-    time.sleep(2)
-
-    print("\n" + "=" * 50)
-    print("  Phase 3: 좌석 스캔 + 클릭")
-    print("=" * 50)
-
-    # 좌석을 찾을 때까지 재스캔
-    for attempt in range(5):
-        if phase3_scan_and_click():
+    rw2, rt2 = find_ticketlink_window()
+    if rw2 == 0:
+        rw2, rt2 = find_any_ticketlink()
+    for _ in range(40):
+        has = _run_js("document.querySelectorAll('#main_view canvas').length;", rw2, rt2)
+        if has and int(has) > 0:
             break
-        print(f"  재스캔 {attempt+1}...")
-        time.sleep(1)
-    else:
-        print("  좌석을 찾을 수 없습니다. 수동으로 선택하세요.")
-        elapsed = time.time() - t_start
-        print(f"\n  경과 시간: {elapsed:.1f}초")
-        return
+        time.sleep(0.05)
+    time.sleep(0.3)
 
-    print("\n" + "=" * 50)
-    print("  Phase 4: 다음단계")
-    print("=" * 50)
-    time.sleep(0.5)
-    phase4_next_step()
+    # 캔버스 위치 캐싱 (Chrome은 이미 활성 상태)
+    cached_canvas = _get_canvas_region() or region
+    print(f"  캔버스 위치: {cached_canvas}")
+
+    # 다음단계 버튼 좌표 미리 캐싱
+    next_btn_pos = None
+    rw3, rt3 = find_ticketlink_window()
+    if rw3 == 0:
+        rw3, rt3 = find_any_ticketlink()
+    if rw3 > 0:
+        js_btn = '''
+        (function() {
+            var btns = document.querySelectorAll('button, a, input[type="button"]');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText || btns[i].value || '').trim();
+                if (t === '다음단계' || t === '다음 단계') {
+                    var rect = btns[i].getBoundingClientRect();
+                    if (rect.width > 0) {
+                        var tb = window.outerHeight - window.innerHeight;
+                        return JSON.stringify({
+                            sx: Math.round(window.screenX + rect.left + rect.width/2),
+                            sy: Math.round(window.screenY + tb + rect.top + rect.height/2)
+                        });
+                    }
+                }
+            }
+            return 'not_found';
+        })();
+        '''
+        result = run_direct_js(js_btn, rw3, rt3)
+        if result and result != 'not_found':
+            import json as _json
+            next_btn_pos = _json.loads(result)
+            print(f"  다음단계 버튼 위치 캐싱: ({next_btn_pos['sx']},{next_btn_pos['sy']})")
+
+    if ASSIST_MODE:
+        print("\n" + "=" * 50)
+        print("  Phase 3+4: 어시스트 모드 (좌석 1개 클릭하세요)")
+        print("=" * 50)
+        if not phase3_assist_mode():
+            print("  어시스트 실패. 수동으로 진행하세요.")
+            return
+    else:
+        print("\n" + "=" * 50)
+        print("  Phase 3: 좌석 스캔 + 클릭")
+        print("=" * 50)
+        for attempt in range(5):
+            if phase3_scan_and_click(cached_region=cached_canvas):
+                break
+            print(f"  재스캔 {attempt+1}...")
+            time.sleep(0.3)
+        else:
+            print("  좌석을 찾을 수 없습니다. 수동으로 선택하세요.")
+            elapsed = time.time() - t_start
+            print(f"\n  경과 시간: {elapsed:.1f}초")
+            return
+
+        # phase3에서 이미 다음단계 클릭함
 
     elapsed = time.time() - t_start
     print(f"\n{'=' * 50}")
@@ -938,6 +1201,7 @@ if __name__ == "__main__":
     print(f"  좌석 수: {SEAT_COUNT}자리")
     print(f"  오픈: {OPEN_TIME}")
     print(f"  좌석 영역: {region}")
+    print(f"  모드: {'어시스트 (1클릭→자동)' if ASSIST_MODE else '전자동'}")
     print()
     print("  스케줄 페이지를 Chrome에 열어두세요:")
     print("  https://facility.ticketlink.co.kr/reserve/product/62162/schedule/sports")
@@ -1076,87 +1340,9 @@ end tell'''
         solve_captcha()
         sys.exit(0)
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--now":
-        print("  --now: 대기 없이 바로 시작! (run_full에서 오픈시간 대기만 건너뜀)")
-        # run_full과 동일한 흐름, 오픈시간 대기만 스킵
-        t_start = time.time()
-
-        print("\n" + "=" * 50)
-        print("  Phase 1: 예매하기 클릭")
-        print("=" * 50)
-        for attempt in range(30):
-            if phase1_click_reserve(do_reload=False):
-                break
-            if attempt == 15:
-                print("  DOM에서 못 찾음, 새로고침 1회...")
-                if phase1_click_reserve(do_reload=True):
-                    break
-            time.sleep(0.3)
-        else:
-            print("  실패")
-            sys.exit(1)
-
-        # 보안문자 (기존 run_full 흐름 그대로)
-        print("\n" + "=" * 50)
-        print("  Phase 1.5: 보안문자 확인")
-        print("=" * 50)
-        time.sleep(1)
-        rw, rt = _find_captcha_tab()
-        if rw > 0:
-            check_js = '''
-            try {
-                var canvas = document.getElementById('captcha_canvas');
-                var popup = document.querySelector('[ng-click*="popupCaptcha.auth"]');
-                document.getElementById('__mr').setAttribute('data-r',
-                    (canvas && canvas.width > 0) || popup ? 'captcha_found' : 'no_captcha');
-            } catch(e) {
-                document.getElementById('__mr').setAttribute('data-r', 'no_captcha');
-            }
-            '''
-            has_captcha = run_page_js(check_js, rw, rt)
-            if has_captcha == 'captcha_found':
-                print("  보안문자 발견! 자동 풀기 시도...")
-                for cap_attempt in range(3):
-                    if solve_captcha():
-                        break
-                    print(f"  캡차 재시도 {cap_attempt+1}...")
-                    time.sleep(1)
-                else:
-                    print("  캡차 자동 풀기 실패. 수동으로 입력하세요.")
-                    input("  입력 후 Enter...")
-            else:
-                print("  보안문자 없음, 계속 진행")
-
-        print("\n" + "=" * 50)
-        print("  Phase 2: 등급/구역 선택")
-        print("=" * 50)
-        if not phase2_select_grade_and_section():
-            print("  등급/구역 선택 실패. 종료.")
-            sys.exit(1)
-
-        print("  좌석 지도 로딩 대기...")
-        time.sleep(2)
-
-        print("\n" + "=" * 50)
-        print("  Phase 3: 좌석 스캔 + 클릭")
-        print("=" * 50)
-        for attempt in range(5):
-            if phase3_scan_and_click():
-                break
-            print(f"  재스캔 {attempt+1}...")
-            time.sleep(1)
-        else:
-            print("  좌석을 찾을 수 없습니다. 수동으로 선택하세요.")
-            sys.exit(1)
-
-        print("\n" + "=" * 50)
-        print("  Phase 4: 다음단계")
-        print("=" * 50)
-        time.sleep(0.5)
-        phase4_next_step()
-
-        elapsed = time.time() - t_start
-        print(f"\n  완료! {elapsed:.1f}초")
+    if "--now" in sys.argv:
+        print("  --now: 대기 없이 바로 시작!")
+        run_full(skip_wait=True)
     else:
         input("  Enter를 누르면 오픈 시간 대기 시작...")
         run_full()
