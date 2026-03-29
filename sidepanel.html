@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace;
+      font-size: 13px;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .header {
+      padding: 8px 12px;
+      background: #313244;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid #45475a;
+    }
+    .header .title { font-weight: 700; font-size: 14px; color: #cba6f7; }
+    .header .badge {
+      margin-left: auto;
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: #45475a;
+      color: #a6adc8;
+    }
+    .header .badge.active { background: #a6e3a1; color: #1e1e2e; }
+
+    /* 탭 */
+    .tabs {
+      display: flex;
+      background: #313244;
+      border-bottom: 1px solid #45475a;
+    }
+    .tab {
+      flex: 1;
+      padding: 8px;
+      text-align: center;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      color: #6c7086;
+      border-bottom: 2px solid transparent;
+      transition: 0.2s;
+    }
+    .tab:hover { color: #cdd6f4; }
+    .tab.active { color: #cba6f7; border-bottom-color: #cba6f7; }
+
+    .tab-content { display: none; flex: 1; overflow-y: auto; flex-direction: column; }
+    .tab-content.active { display: flex; }
+
+    /* 공통 */
+    .section {
+      margin: 8px;
+      background: #313244;
+      border-radius: 6px;
+      border: 1px solid #45475a;
+    }
+    .section-header {
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      color: #a6adc8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid #45475a;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .section-header .count {
+      background: #45475a;
+      padding: 1px 6px;
+      border-radius: 8px;
+      font-size: 10px;
+    }
+    .section-body {
+      padding: 6px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    /* 네트워크 로그 */
+    .net-entry {
+      padding: 4px 6px;
+      border-bottom: 1px solid #45475a;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .net-entry:hover { background: #45475a; }
+    .net-entry .method {
+      display: inline-block;
+      width: 36px;
+      font-weight: 700;
+      font-size: 10px;
+    }
+    .net-entry .method.GET { color: #a6e3a1; }
+    .net-entry .method.POST { color: #f9e2af; }
+    .net-entry .url { color: #89b4fa; word-break: break-all; }
+    .net-entry .meta { color: #6c7086; font-size: 10px; margin-top: 2px; }
+    .net-entry .meta .status-ok { color: #a6e3a1; }
+    .net-entry .meta .status-err { color: #f38ba8; }
+    .net-entry .preview {
+      display: none;
+      margin-top: 4px;
+      padding: 4px;
+      background: #1e1e2e;
+      border-radius: 4px;
+      font-size: 10px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 150px;
+      overflow-y: auto;
+      color: #a6adc8;
+    }
+    .net-entry.expanded .preview { display: block; }
+
+    /* DOM 스냅샷 */
+    .dom-item {
+      padding: 4px 6px;
+      border-bottom: 1px solid #45475a;
+      font-size: 11px;
+    }
+    .dom-item .tag { color: #f38ba8; font-weight: 700; }
+    .dom-item .id { color: #f9e2af; }
+    .dom-item .detail { color: #6c7086; font-size: 10px; }
+
+    /* 이벤트 로그 */
+    .log-entry {
+      padding: 3px 6px;
+      font-size: 11px;
+      border-bottom: 1px solid rgba(69,71,90,0.5);
+    }
+    .log-entry.info { color: #89b4fa; }
+    .log-entry.warn { color: #f9e2af; }
+    .log-entry.error { color: #f38ba8; }
+    .log-entry.success { color: #a6e3a1; }
+    .log-entry .time { color: #6c7086; margin-right: 6px; }
+
+    /* 콘솔 */
+    .console-input {
+      display: flex;
+      gap: 4px;
+      padding: 8px;
+      background: #313244;
+      border-top: 1px solid #45475a;
+    }
+    .console-input input {
+      flex: 1;
+      background: #1e1e2e;
+      border: 1px solid #45475a;
+      color: #cdd6f4;
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    .console-input button {
+      background: #cba6f7;
+      color: #1e1e2e;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    /* 스냅샷 버튼 */
+    .action-btn {
+      background: #45475a;
+      color: #cdd6f4;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .action-btn:hover { background: #585b70; }
+
+    /* API 키 */
+    .api-row {
+      display: flex; gap: 4px; padding: 8px;
+    }
+    .api-row input {
+      flex: 1; background: #1e1e2e; border: 1px solid #45475a;
+      color: #cdd6f4; padding: 4px 6px; border-radius: 4px; font-size: 11px;
+    }
+    .api-row button {
+      background: #cba6f7; color: #1e1e2e; border: none;
+      padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; font-weight: 600;
+    }
+    .api-status { font-size: 10px; padding: 0 8px 4px; }
+    .api-status.ok { color: #a6e3a1; }
+    .api-status.no { color: #f38ba8; }
+
+    .toggle-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 6px 8px;
+    }
+    .toggle-row label { font-size: 12px; color: #a6adc8; }
+    input[type="checkbox"] { accent-color: #cba6f7; }
+
+    .waiting {
+      text-align: center; padding: 20px; color: #6c7086;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="title">Ticket Helper</span>
+    <span class="badge" id="status-badge">대기</span>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="spy">페이지 분석</div>
+    <div class="tab" data-tab="settings">설정</div>
+  </div>
+
+  <!-- 페이지 분석 탭 -->
+  <div class="tab-content active" id="tab-spy">
+    <div class="section">
+      <div class="section-header">
+        이벤트 로그
+        <button class="action-btn" id="clearLogBtn">지우기</button>
+      </div>
+      <div class="section-body" id="event-log" style="max-height:200px;"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        네트워크
+        <span class="count" id="net-count">0</span>
+      </div>
+      <div class="section-body" id="network-log" style="max-height:400px;"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        DOM 스냅샷
+        <button class="action-btn" id="snapshotBtn">찍기</button>
+      </div>
+      <div class="section-body" id="dom-snapshot">
+        <div class="waiting">버튼을 눌러 현재 DOM 상태를 확인하세요</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        사이트 분석
+        <div style="display:flex; gap:4px;">
+          <button class="action-btn" id="analyzeBtn">분석</button>
+          <button class="action-btn" id="copyAnalysisBtn" style="display:none;">복사</button>
+        </div>
+      </div>
+      <div class="section-body" id="analysis-result" style="max-height:500px;">
+        <div class="waiting">SVG맵, Angular scope, API 엔드포인트 등 심층 분석</div>
+      </div>
+    </div>
+
+    <div class="console-input">
+      <input type="text" id="jsInput" placeholder="JS 실행 (Enter)">
+      <button id="jsRunBtn">Run</button>
+    </div>
+  </div>
+
+  <!-- 설정 탭 -->
+  <div class="tab-content" id="tab-settings">
+    <div class="section">
+      <div class="section-header">Claude API</div>
+      <div class="api-row">
+        <input type="password" id="apiKeyInput" placeholder="sk-ant-...">
+        <button id="saveKeyBtn">저장</button>
+      </div>
+      <div id="apiKeyStatus" class="api-status"></div>
+    </div>
+    <div class="section">
+      <div class="section-header">옵션</div>
+      <div class="toggle-row">
+        <label>예매안내 팝업 자동 닫기</label>
+        <input type="checkbox" id="autoCloseToggle" checked>
+      </div>
+    </div>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

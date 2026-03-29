@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "티켓 헬퍼",
+  "version": "3.0",
+  "description": "티켓 예매 보조 - 페이지 분석 & 캡차 자동입력",
+  "permissions": ["storage", "activeTab", "sidePanel", "scripting"],
+  "host_permissions": [
+    "https://poticket.interpark.com/*",
+    "https://tickets.interpark.com/*",
+    "https://ticket.interpark.com/*",
+    "https://*.ticketlink.co.kr/*",
+    "https://api.anthropic.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://poticket.interpark.com/*",
+        "https://tickets.interpark.com/*",
+        "https://ticket.interpark.com/*",
+        "https://*.ticketlink.co.kr/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
