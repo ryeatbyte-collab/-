@@ -8,7 +8,9 @@ import tempfile
 import os
 import sys
 import random
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import requests
 from pynput import mouse, keyboard as kb
 import pyautogui
 import numpy as np
@@ -785,10 +787,10 @@ def phase3_scan_and_click(cached_region=None):
         print(f"  좌석 {i+1}: ({real_x}, {real_y})")
         time.sleep(0.25)
 
-    # 즉시 다음단계
+    # 다음단계
     time.sleep(0.25)
     click_at(NEXT_BTN_POS[0], NEXT_BTN_POS[1])
-    print(f"  다음단계 즉시 클릭! {NEXT_BTN_POS}")
+    print(f"  다음단계 클릭! {NEXT_BTN_POS}")
     return True
 
 
@@ -988,33 +990,211 @@ def phase4_next_step():
     return True
 
 
+# ==================== 서버 시간 동기화 ====================
+_sync_session = requests.Session()  # keep-alive로 RTT 안정화
+
+def get_server_time_offset_rough():
+    """1단계: 대략적 동기화 (±500ms) — Date 헤더 기반"""
+    offsets = []
+    for i in range(5):
+        try:
+            t_before = time.time()
+            resp = _sync_session.head("https://www.ticketlink.co.kr", timeout=3)
+            t_after = time.time()
+            rtt = t_after - t_before
+            local_at_server = t_before + rtt / 2
+
+            server_dt = parsedate_to_datetime(resp.headers['Date'])
+            server_ts = server_dt.timestamp()
+
+            offset = server_ts - local_at_server
+            offsets.append(offset)
+        except Exception as e:
+            print(f"  시간 동기화 시도 {i+1} 실패: {e}")
+    if not offsets:
+        return 0.0
+    offsets.sort()
+    return offsets[len(offsets) // 2]
+
+
+def get_server_time_offset_precise(num_boundaries=7):
+    """2~3단계: 초 경계 감지로 정밀 동기화 (±5-10ms)
+
+    Date 헤더가 N초 → N+1초로 바뀌는 순간을 포착하여
+    서버의 정확한 초 경계를 로컬 시각으로 매핑한다.
+    """
+    offsets = []
+    median_rtt = None
+
+    # 먼저 RTT 기준선 측정 (5회)
+    rtts = []
+    for _ in range(5):
+        try:
+            t0 = time.perf_counter()
+            resp = _sync_session.head("https://www.ticketlink.co.kr", timeout=3)
+            t1 = time.perf_counter()
+            rtts.append(t1 - t0)
+        except:
+            pass
+        time.sleep(0.01)
+    if rtts:
+        rtts.sort()
+        median_rtt = rtts[len(rtts) // 2]
+        print(f"  RTT 기준선: {median_rtt*1000:.1f}ms (min={min(rtts)*1000:.1f}, max={max(rtts)*1000:.1f})")
+    else:
+        print("  RTT 측정 실패! 대략적 동기화로 폴백")
+        return get_server_time_offset_rough()
+
+    rtt_threshold = median_rtt * 2.0  # 이 이상이면 버림
+
+    boundaries_found = 0
+    attempts = 0
+    max_attempts = num_boundaries * 3  # 최대 시도 횟수
+
+    while boundaries_found < num_boundaries and attempts < max_attempts:
+        attempts += 1
+        try:
+            # 현재 초 값 확인
+            resp = _sync_session.head("https://www.ticketlink.co.kr", timeout=3)
+            prev_date = resp.headers.get('Date', '')
+            prev_second = prev_date.split(':')[-1].split(' ')[0] if ':' in prev_date else ''
+
+            # 초가 바뀔 때까지 빠르게 polling (35ms 간격)
+            last_t = time.perf_counter()
+            last_rtt = 0
+            boundary_detected = False
+
+            for _ in range(60):  # 최대 ~2초
+                t_send = time.perf_counter()
+                resp = _sync_session.head("https://www.ticketlink.co.kr", timeout=3)
+                t_recv = time.perf_counter()
+                rtt = t_recv - t_send
+
+                cur_date = resp.headers.get('Date', '')
+                cur_second = cur_date.split(':')[-1].split(' ')[0] if ':' in cur_date else ''
+
+                if cur_second != prev_second and prev_second:
+                    # 초 경계 감지!
+                    if rtt < rtt_threshold and last_rtt < rtt_threshold:
+                        # 서버의 XX:YY.000 = 로컬 어디?
+                        # last_t: 마지막 이전 초 요청 전송 시각
+                        # t_send: 첫 다음 초 요청 전송 시각
+                        boundary_local = (last_t + t_send) / 2 + (last_rtt + rtt) / 4
+
+                        # 서버 시각 (정수 초)
+                        server_dt = parsedate_to_datetime(cur_date)
+                        server_boundary = server_dt.timestamp()  # XX:YY:SS.000
+
+                        # perf_counter → time.time 변환
+                        pc_now = time.perf_counter()
+                        tt_now = time.time()
+                        boundary_time_time = tt_now - (pc_now - boundary_local)
+
+                        offset = server_boundary - boundary_time_time
+                        offsets.append(offset)
+                        boundaries_found += 1
+
+                        gap_ms = (t_send - last_t) * 1000
+                        print(f"  경계 #{boundaries_found}: offset={offset:+.4f}s "
+                              f"(gap={gap_ms:.0f}ms rtt={rtt*1000:.0f}/{last_rtt*1000:.0f}ms)")
+
+                    boundary_detected = True
+                    break
+
+                last_t = t_send
+                last_rtt = rtt
+                prev_second = cur_second
+
+                # 다음 요청까지 대기 (35ms 간격 목표)
+                elapsed = time.perf_counter() - t_send
+                wait = 0.035 - elapsed
+                if wait > 0:
+                    time.sleep(wait)
+
+            if not boundary_detected:
+                # 2초 안에 경계 못 찾음 — 잠시 ��기 후 재시도
+                time.sleep(0.1)
+
+        except Exception as e:
+            print(f"  경계 감지 오류: {e}")
+            time.sleep(0.1)
+
+    if not offsets:
+        print("  정밀 동기화 실패! 대략적 동기화로 폴백")
+        return get_server_time_offset_rough()
+
+    offsets.sort()
+    median_offset = offsets[len(offsets) // 2]
+    spread = offsets[-1] - offsets[0]
+    print(f"  정밀 동기화 완료: offset={median_offset:+.4f}s "
+          f"(���위={spread*1000:.1f}ms, {len(offsets)}개 경계)")
+    return median_offset
+
+
+def server_now(offset):
+    """서버 시간 기준 현재 시각"""
+    return datetime.fromtimestamp(time.time() + offset)
+
+
 # ==================== 메인 ====================
 def wait_for_open_time():
-    """오픈 시간까지 대기"""
-    today = datetime.now().strftime("%Y-%m-%d")
-    target = datetime.strptime(f"{today} {OPEN_TIME}", "%Y-%m-%d %H:%M:%S")
+    """오픈 시간까지 대기 (정밀 서버 시간 동기화)"""
+    # 1단계: 대략적 동기화 (빠르게)
+    print("  1단계: 대략적 시간 동기��...")
+    rough_offset = get_server_time_offset_rough()
+    print(f"  대략적 offset: {rough_offset:+.3f}초")
 
-    now = datetime.now()
-    if now >= target:
+    today = server_now(rough_offset).strftime("%Y-%m-%d")
+    target_dt = datetime.strptime(f"{today} {OPEN_TIME}", "%Y-%m-%d %H:%M:%S")
+    target_ts = target_dt.timestamp()
+
+    now = server_now(rough_offset)
+    if now >= target_dt:
         print("  이미 오픈 시간이 지났습니다. 바로 시작합니다.")
         return
 
-    wait_seconds = (target - now).total_seconds()
-    print(f"  {OPEN_TIME} 까지 {wait_seconds:.0f}초 대기...")
+    wait_seconds = (target_dt - now).total_seconds()
+    print(f"  {OPEN_TIME} 까지 {wait_seconds:.0f}초 대기")
     print(f"  (Ctrl+C로 대기 취소 후 바로 시작 가능)")
 
     try:
-        # 10초 전까지 대기
-        while (target - datetime.now()).total_seconds() > 10:
-            remaining = (target - datetime.now()).total_seconds()
+        # 30초 전까지 느긋하게 대기
+        while (target_dt - server_now(rough_offset)).total_seconds() > 30:
+            remaining = (target_dt - server_now(rough_offset)).total_seconds()
             print(f"\r  남은 시간: {remaining:.0f}초  ", end="", flush=True)
             time.sleep(1)
         print()
 
-        # 마지막 10초는 정밀 대기
-        print("  10초 전! 준비 중...")
-        while datetime.now() < target:
-            time.sleep(0.01)
+        # 2~3단계: 정밀 동기화 (오픈 25~15초 전)
+        print("\n  2단계: 정밀 시간 동기화 (초 경계 감지)...")
+        precise_offset = get_server_time_offset_precise(num_boundaries=7)
+        improvement = abs(precise_offset - rough_offset) * 1000
+        print(f"  대략→정밀 차이: {improvement:.1f}ms")
+
+        # 정밀 offset으로 타겟 시각 재계산
+        target_perf = time.perf_counter() + (target_ts - (time.time() + precise_offset))
+        remaining = target_perf - time.perf_counter()
+        print(f"\n  오픈까지 {remaining:.2f}초 (정밀 기준)")
+
+        # 50ms 전까지 sleep
+        while True:
+            remaining = target_perf - time.perf_counter()
+            if remaining <= 0.05:
+                break
+            if remaining > 1:
+                print(f"\r  남은 시간: {remaining:.1f}초  ", end="", flush=True)
+                time.sleep(min(0.5, remaining - 0.05))
+            else:
+                time.sleep(0.001)
+        print()
+
+        # 마지막 50ms: spin-wait (perf_counter 기반)
+        print("  spin-wait 진입...")
+        while time.perf_counter() < target_perf:
+            pass
+
+        overshoot = (time.perf_counter() - target_perf) * 1000
+        print(f"  GO! (overshoot: {overshoot:.2f}ms)")
 
     except KeyboardInterrupt:
         print("\n  대기 취소! 바로 시작합니다.")
@@ -1186,6 +1366,12 @@ if __name__ == "__main__":
     print(f"  좌석 영역: {region}")
     print(f"  모드: {'어시스트 (1클릭→자동)' if ASSIST_MODE else '전자동'}")
     print()
+    print("  사용법:")
+    print("    python3 macro_full.py          # 오픈 시간 대기 → 전자동")
+    print("    python3 macro_full.py --now     # 대기 없이 바로 시작")
+    print("    python3 macro_full.py --cancel  # 취소표 자동 잡기")
+    print("    python3 macro_full.py --sync    # 정밀 시간 동기화 테스트")
+    print()
     print("  스케줄 페이지를 Chrome에 열어두세요:")
     print("  https://facility.ticketlink.co.kr/reserve/product/62162/schedule/sports")
     print()
@@ -1313,6 +1499,209 @@ end tell'''
             time.sleep(0.5)
 
         print(f"\n  총 {(time.time()-t_start)*1000:.0f}ms")
+        sys.exit(0)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--sync":
+        print("=" * 50)
+        print("  정밀 시간 동기화 테스트")
+        print("=" * 50)
+        print()
+        print("  1단계: 대략적 동기화...")
+        rough = get_server_time_offset_rough()
+        print(f"  대략적 offset: {rough:+.4f}초")
+        print()
+        print("  2단계: 정밀 동기화 (초 경계 감지)...")
+        precise = get_server_time_offset_precise(num_boundaries=7)
+        print()
+        print(f"  대략적 offset: {rough:+.4f}초 (±500ms)")
+        print(f"  정밀 offset:   {precise:+.4f}초 (±5-10ms)")
+        print(f"  차이:          {abs(precise - rough)*1000:.1f}ms")
+        print()
+        server_time = datetime.fromtimestamp(time.time() + precise)
+        local_time = datetime.now()
+        print(f"  로컬 시각:  {local_time.strftime('%H:%M:%S.%f')[:-3]}")
+        print(f"  서버 시각:  {server_time.strftime('%H:%M:%S.%f')[:-3]}")
+        sys.exit(0)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--cancel":
+        print("=" * 50)
+        print("  취소표 자동 잡기 모드")
+        print("=" * 50)
+        print(f"  대상: {GRADE_NAME} {TARGET_SECTION}구역")
+        print(f"  필요 좌석: {SEAT_COUNT}자리")
+        print()
+        print("  1) 스케줄 페이지에서 예매하기 → 캡차 통과까지 자동 진행")
+        print("  2) 등급 선택 후 타겟 구역 잔여석 polling")
+        print(f"  3) {SEAT_COUNT}석 이상 풀리면 자동 진입")
+        print()
+        input("  Enter를 누르면 시작...")
+
+        t_start = time.time()
+
+        # Phase 1: 예매하기 클릭
+        print("\n── Phase 1: 예매하기 클릭 ──")
+        if not phase1_click_reserve():
+            print("  예매하기 실패!")
+            sys.exit(1)
+        time.sleep(0.3)
+
+        # Phase 1.5: 캡차
+        print("\n── Phase 1.5: 보안문자 ──")
+        captcha_found = False
+        for i in range(20):
+            rw, rt = _find_captcha_tab()
+            if rw > 0:
+                check_js = '''
+                try {
+                    var canvas = document.getElementById('captcha_canvas');
+                    var popup = document.querySelector('[ng-click*="popupCaptcha.auth"]');
+                    document.getElementById('__mr').setAttribute('data-r',
+                        (canvas && canvas.width > 0) || popup ? 'captcha_found' : 'no_captcha');
+                } catch(e) {
+                    document.getElementById('__mr').setAttribute('data-r', 'no_captcha');
+                }
+                '''
+                has_captcha = run_page_js(check_js, rw, rt)
+                if has_captcha == 'captcha_found':
+                    captcha_found = True
+                    break
+            time.sleep(0.1)
+            if not captcha_found and i >= 5:
+                break
+        if captcha_found:
+            print("  보안문자 발견! 풀기 시도...")
+            for cap_attempt in range(3):
+                if solve_captcha():
+                    break
+                print(f"  재시도 {cap_attempt+1}...")
+                time.sleep(1)
+            else:
+                print("  캡차 실패. 수동으로 입력하세요.")
+                input("  입력 후 Enter...")
+        else:
+            print("  보안문자 없음")
+
+        # Phase 2: 등급 선택까지만
+        print("\n── Phase 2: 등급 선택 ──")
+        rw, rt = 0, 0
+        sw, st = find_schedule_window()
+        if sw > 0:
+            for attempt in range(60):
+                url = _run_js("location.href;", sw, st)
+                if "reserve/plan/schedule" in url:
+                    rw, rt = sw, st
+                    break
+                time.sleep(0.05)
+        if rw == 0:
+            for attempt in range(60):
+                rw, rt = find_ticketlink_window()
+                if rw > 0:
+                    break
+                time.sleep(0.05)
+        if rw == 0:
+            print("  좌석 선택 페이지를 찾을 수 없습니다!")
+            sys.exit(1)
+        print(f"  좌석 선택 페이지: window {rw}, tab {rt}")
+
+        # 등급 로딩 + 클릭
+        js_grade = f'''
+        (function() {{
+            var grades = document.querySelectorAll('[ng-click*="select.select"]');
+            for (var i = 0; i < grades.length; i++) {{
+                if (grades[i].innerText.indexOf('{GRADE_NAME}') > -1) {{
+                    grades[i].click();
+                    return 'grade_clicked:' + grades[i].innerText.substring(0,30).replace(/\\n/g,' ');
+                }}
+            }}
+            return 'grade_not_found:count=' + grades.length;
+        }})();
+        '''
+        for _ in range(60):
+            result = run_direct_js(js_grade, rw, rt)
+            if result.startswith("grade_clicked"):
+                break
+            time.sleep(0.05)
+        else:
+            print("  등급 선택 실패!")
+            sys.exit(1)
+        print(f"  {result}")
+
+        # 취소표 polling 시작
+        print(f"\n── 취소표 대기 중 ({TARGET_SECTION}구역, {SEAT_COUNT}석 이상) ──")
+        print("  Ctrl+C로 중단")
+        js_check = f'''
+        (function() {{
+            var zones = document.querySelectorAll('[ng-click*="grade.select"]');
+            for (var i = 0; i < zones.length; i++) {{
+                var text = zones[i].innerText;
+                if (text.indexOf('{TARGET_SECTION}구역') > -1) {{
+                    var match = text.match(/(\\d+)\\s*석/);
+                    return match ? match[1] : '0';
+                }}
+            }}
+            return '0';
+        }})();
+        '''
+        poll_count = 0
+        try:
+            while True:
+                seats_str = run_direct_js(js_check, rw, rt)
+                try:
+                    seats = int(seats_str)
+                except:
+                    seats = 0
+                poll_count += 1
+                now_str = datetime.now().strftime("%H:%M:%S")
+                print(f"\r  [{now_str}] {TARGET_SECTION}구역: {seats}석 (polling #{poll_count})  ", end="", flush=True)
+
+                if seats >= SEAT_COUNT:
+                    print(f"\n\n  취소표 발견! {seats}석!")
+                    # 구역 클릭 + 좌석 스캔 + 다음단계
+                    js_section = f'''
+                    (function() {{
+                        var zones = document.querySelectorAll('[ng-click*="grade.select"]');
+                        for (var i = 0; i < zones.length; i++) {{
+                            var text = zones[i].innerText;
+                            if (text.indexOf('{TARGET_SECTION}구역') > -1) {{
+                                zones[i].click();
+                                return 'section_clicked:' + text.trim().replace(/\\n/g, ' ');
+                            }}
+                        }}
+                        return 'not_found';
+                    }})();
+                    '''
+                    sec_result = run_direct_js(js_section, rw, rt)
+                    print(f"  구역 선택: {sec_result}")
+
+                    # 좌석 지도 로딩 대기
+                    print("  좌석 지도 로딩 대기...")
+                    for _ in range(40):
+                        has = _run_js("document.querySelectorAll('#main_view canvas').length;", rw, rt)
+                        if has and int(has) > 0:
+                            break
+                        time.sleep(0.05)
+                    time.sleep(0.3)
+
+                    cached_canvas = _get_canvas_region() or region
+                    print(f"  캔버스 위치: {cached_canvas}")
+
+                    # 좌석 스캔 + 클릭
+                    print("\n── 좌석 스캔 + 클릭 ──")
+                    for attempt in range(5):
+                        if phase3_scan_and_click(cached_region=cached_canvas):
+                            break
+                        print(f"  재스캔 {attempt+1}...")
+                        time.sleep(0.3)
+                    else:
+                        print("  좌석을 찾을 수 없습니다.")
+
+                    elapsed = time.time() - t_start
+                    print(f"\n  완료! 총 {elapsed:.1f}초 (polling {poll_count}회)")
+                    break
+
+                time.sleep(2)  # 2초 간격 polling (너무 빠르면 차단 위험)
+        except KeyboardInterrupt:
+            print(f"\n\n  중단됨 (polling {poll_count}회)")
         sys.exit(0)
 
     if len(sys.argv) > 1 and sys.argv[1] == "--captcha":
