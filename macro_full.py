@@ -211,92 +211,88 @@ def find_consecutive_seats(seats, count):
 mouse_controller = mouse.Controller()
 
 def click_at(x, y):
-    mouse_controller.position = (x - 5, y)
-    time.sleep(0.0005)
+    # 사람처럼 미세하게 접근 후 클릭 (~15-25ms)
+    ox = random.randint(-6, -3)
+    oy = random.randint(-3, 3)
+    mouse_controller.position = (x + ox, y + oy)
+    time.sleep(random.uniform(0.004, 0.008))
+    mouse_controller.position = (x + ox // 2, y + oy // 2)
+    time.sleep(random.uniform(0.003, 0.006))
     mouse_controller.position = (x, y)
-    time.sleep(0.00015)
+    time.sleep(random.uniform(0.002, 0.005))
     mouse_controller.press(mouse.Button.left)
-    time.sleep(0.0005)
+    time.sleep(random.uniform(0.001, 0.003))
     mouse_controller.release(mouse.Button.left)
 
 
 # ==================== 티켓링크 창 찾기 ====================
-def find_ticketlink_window():
-    """티켓링크 예매 창(reserve/plan/schedule) 찾기 → (window, tab) 반환"""
+# ==================== 탭 캐시 (AppleScript 호출 최소화) ====================
+_tab_cache = {
+    'tabs': [],       # [(window, tab, url), ...]
+    'timestamp': 0,   # 마지막 갱신 시각 (time.time)
+    'ttl': 0.5,       # 캐시 유효 시간 (초)
+}
+
+
+def _refresh_tab_cache(force=False):
+    """모든 Chrome 탭 URL을 한 번에 가져와 캐싱. AppleScript 1회."""
+    now = time.time()
+    if not force and _tab_cache['tabs'] and (now - _tab_cache['timestamp']) < _tab_cache['ttl']:
+        return _tab_cache['tabs']
+
     applescript = '''
 tell application "Google Chrome"
+    set r to ""
     set winCount to count of windows
     repeat with w from 1 to winCount
         repeat with i from 1 to count of tabs of window w
             set u to URL of tab i of window w
-            if u contains "ticketlink.co.kr/reserve/plan/schedule" then
-                return (w as text) & "," & (i as text)
-            end if
+            set r to r & w & "," & i & "," & u & linefeed
         end repeat
     end repeat
-    return "0,0"
+    return r
 end tell'''
     with tempfile.NamedTemporaryFile(mode='w', suffix='.applescript', delete=False) as f:
         f.write(applescript)
         f.flush()
         result = subprocess.run(["osascript", f.name], capture_output=True, text=True, timeout=10)
         os.unlink(f.name)
-    parts = result.stdout.strip().split(",")
-    if len(parts) == 2:
-        return int(parts[0]), int(parts[1])
+
+    tabs = []
+    for line in result.stdout.strip().split('\n'):
+        parts = line.strip().split(',', 2)
+        if len(parts) == 3:
+            try:
+                tabs.append((int(parts[0]), int(parts[1]), parts[2]))
+            except ValueError:
+                continue
+
+    _tab_cache['tabs'] = tabs
+    _tab_cache['timestamp'] = time.time()
+    return tabs
+
+
+def find_ticketlink_window():
+    """티켓링크 예매 창(reserve/plan/schedule) 찾기 → (window, tab) 반환"""
+    for w, t, url in _refresh_tab_cache():
+        if "ticketlink.co.kr/reserve/plan/schedule" in url:
+            return w, t
     return 0, 0
 
 
 def find_schedule_window():
     """티켓링크 스케줄 페이지 찾기"""
-    applescript = '''
-tell application "Google Chrome"
-    set winCount to count of windows
-    repeat with w from 1 to winCount
-        repeat with i from 1 to count of tabs of window w
-            set u to URL of tab i of window w
-            if u contains "ticketlink.co.kr" and u contains "schedule" and u does not contain "reserve/plan" then
-                return (w as text) & "," & (i as text)
-            end if
-        end repeat
-    end repeat
-    return "0,0"
-end tell'''
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.applescript', delete=False) as f:
-        f.write(applescript)
-        f.flush()
-        result = subprocess.run(["osascript", f.name], capture_output=True, text=True, timeout=10)
-        os.unlink(f.name)
-    parts = result.stdout.strip().split(",")
-    if len(parts) == 2:
-        return int(parts[0]), int(parts[1])
+    for w, t, url in _refresh_tab_cache():
+        if "ticketlink.co.kr" in url and "schedule" in url and "reserve/plan" not in url:
+            return w, t
     return 0, 0
 
 
-# ==================== 티켓링크 아무 탭 찾기 ====================
 def find_any_ticketlink():
     """ticketlink.co.kr이 열린 아무 탭 찾기"""
-    applescript = '''
-tell application "Google Chrome"
-    set winCount to count of windows
-    repeat with w from 1 to winCount
-        repeat with i from 1 to count of tabs of window w
-            set u to URL of tab i of window w
-            if u contains "ticketlink.co.kr" then
-                return (w as text) & "," & (i as text)
-            end if
-        end repeat
-    end repeat
-    return "0,0"
-end tell'''
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.applescript', delete=False) as f:
-        f.write(applescript)
-        f.flush()
-        result = subprocess.run(["osascript", f.name], capture_output=True, text=True, timeout=10)
-        os.unlink(f.name)
-    parts = result.stdout.strip().split(",")
-    if len(parts) == 2:
-        return int(parts[0]), int(parts[1])
+    for w, t, url in _refresh_tab_cache():
+        if "ticketlink.co.kr" in url:
+            return w, t
     return 0, 0
 
 
@@ -646,9 +642,9 @@ end tell'''
         time.sleep(0.1)
         click_at(data['sx'], data['sy'])
         print(f"  예매하기 클릭: {data.get('text','')}")
-        return True
+        return 'clicked'
     elif data.get('status') == 'not_open_yet':
-        return False
+        return 'not_open_yet'
     else:
         print("  해당 날짜 경기를 찾을 수 없습니다.")
         return False
@@ -671,6 +667,7 @@ def phase2_select_grade_and_section():
             time.sleep(0.05)
         else:
             # 혹시 새 창으로 열렸을 수도 있으니 확인
+            _refresh_tab_cache(force=True)
             rw, rt = find_ticketlink_window()
             if rw == 0:
                 print("  좌석 선택 페이지를 찾을 수 없습니다!")
@@ -679,6 +676,7 @@ def phase2_select_grade_and_section():
     else:
         # 스케줄 탭이 사라졌으면 이미 전환된 것 → 예매 페이지 찾기
         for attempt in range(60):
+            _refresh_tab_cache(force=True)
             rw, rt = find_ticketlink_window()
             if rw > 0:
                 print(f"  좌석 선택 페이지 발견: window {rw}, tab {rt}")
@@ -766,9 +764,10 @@ end tell'''
     time.sleep(0.15)
 
 
-def _get_canvas_region():
+def _get_canvas_region(rw=0, rt=0):
     """캔버스의 화면 좌표를 JS로 동적으로 가져오기"""
-    rw, rt = find_ticketlink_window()
+    if rw == 0:
+        rw, rt = find_ticketlink_window()
     if rw == 0:
         rw, rt = find_any_ticketlink()
     if rw == 0:
@@ -794,8 +793,7 @@ def _get_canvas_region():
     ''', rw, rt)
     if not result or result == 'not_found':
         return None
-    import json as _json
-    r = _json.loads(result)
+    r = json.loads(result)
     return (r['x'], r['y'], r['w'], r['h'])
 
 
@@ -866,100 +864,49 @@ def phase3_assist_mode():
         print("  타임아웃 (60초)")
         return False
 
-    user_x, user_y = click_pos[0]
+    user_x, user_y = int(click_pos[0][0]), int(click_pos[0][1])
+    listener.stop()
     print(f"  클릭 감지! ({user_x},{user_y}) {(time.time()-t0)*1000:.0f}ms")
 
-    # 좌석 등록 + 캔버스 렌더링 대기
-    time.sleep(0.5)
-
-    # 클릭 위치 주변 미니 스캔 (사용자 좌석은 이미 색 변경됨)
+    # 클릭 위치 오른쪽으로 미니 스캔 (사용자 좌석은 이미 선택됨)
     scan_w, scan_h = 400, 50
-    mini_x = max(0, user_x - 20)
+    mini_x = max(0, user_x + 15)  # 사용자 좌석 오른쪽부터
     mini_y = max(0, user_y - scan_h // 2)
 
     screenshot = pyautogui.screenshot(region=(mini_x, mini_y, scan_w, scan_h))
     img = np.array(screenshot.convert("RGB"))
     seats = find_seats(img)
 
-    user_local_x = user_x - mini_x
     user_local_y = user_y - mini_y
 
-    # 같은 행에서 사용자 클릭 위치 제외 (±15px) → 오른쪽 우선
-    right = [s for s in seats
-             if abs(s['cy'] - user_local_y) <= 8 and s['cx'] > user_local_x + 15]
+    # 같은 행에서 오른쪽 좌석들
+    right = [s for s in seats if abs(s['cy'] - user_local_y) <= 8]
     right.sort(key=lambda s: s['cx'])
-
-    # 오른쪽 부족하면 왼쪽도
-    left = [s for s in seats
-            if abs(s['cy'] - user_local_y) <= 8 and s['cx'] < user_local_x - 15]
-    left.sort(key=lambda s: -s['cx'])  # 가까운 순
 
     to_click = right[:SEAT_COUNT - 1]
     if len(to_click) < SEAT_COUNT - 1:
-        to_click += left[:SEAT_COUNT - 1 - len(to_click)]
+        print(f"  오른쪽 좌석 부족 ({len(to_click)}석만 발견, 행 필터 전 {len(seats)}개)")
+        return False
 
-    clicked = 0
-    for s in to_click:
+    for i, s in enumerate(to_click):
         rx = mini_x + s['cx']
         ry = mini_y + s['cy']
         click_at(rx, ry)
-        clicked += 1
-        print(f"  자동 좌석 {clicked+1}: ({rx},{ry})")
-        time.sleep(0.1)
+        print(f"  자동 좌석 {i+2}: ({rx},{ry})")
 
-    listener.stop()
+    print(f"  {SEAT_COUNT}석 완료! {(time.time()-t0)*1000:.0f}ms")
 
-    if clicked < SEAT_COUNT - 1:
-        print(f"  옆자리 부족 ({clicked}석만 추가)")
-        return False
-
-    # 검증
-    time.sleep(0.3)
-    count = _verify_seat_selection()
-    print(f"  검증: {count}석 선택됨")
-    if count < SEAT_COUNT:
-        print(f"  부족! 수동으로 추가 후 다음단계를 눌러주세요.")
-        return False
-
-    print(f"  {count}석 완료! {(time.time()-t0)*1000:.0f}ms")
-
-    # 즉시 다음단계 클릭
-    time.sleep(0.05)
-    rw, rt = find_ticketlink_window()
-    if rw == 0:
-        rw, rt = find_any_ticketlink()
-    if rw > 0:
-        js_btn = '''
-        (function() {
-            var btns = document.querySelectorAll('button, a, input[type="button"]');
-            for (var i = 0; i < btns.length; i++) {
-                var t = (btns[i].innerText || btns[i].value || '').trim();
-                if (t === '다음단계' || t === '다음 단계') {
-                    var rect = btns[i].getBoundingClientRect();
-                    if (rect.width > 0) {
-                        var tb = window.outerHeight - window.innerHeight;
-                        return JSON.stringify({
-                            sx: Math.round(window.screenX + rect.left + rect.width/2),
-                            sy: Math.round(window.screenY + tb + rect.top + rect.height/2)
-                        });
-                    }
-                }
-            }
-            return 'not_found';
-        })();
-        '''
-        result = run_direct_js(js_btn, rw, rt)
-        if result and result != 'not_found':
-            import json as _json
-            pos = _json.loads(result)
-            click_at(pos['sx'], pos['sy'])
-            print(f"  다음단계 즉시 클릭! ({pos['sx']},{pos['sy']}) {(time.time()-t0)*1000:.0f}ms")
+    # 바로 다음단계 클릭
+    time.sleep(0.35)
+    click_at(NEXT_BTN_POS[0], NEXT_BTN_POS[1])
+    print(f"  다음단계 클릭! {NEXT_BTN_POS}")
     return True
 
 
-def _verify_seat_selection():
+def _verify_seat_selection(rw=0, rt=0):
     """좌석이 실제로 선택되었는지 확인 (tk.state.select.getTotalCnt)"""
-    rw, rt = find_ticketlink_window()
+    if rw == 0:
+        rw, rt = find_ticketlink_window()
     if rw == 0:
         rw, rt = find_any_ticketlink()
     if rw == 0:
@@ -1029,8 +976,7 @@ def phase4_next_step():
         print("  다음단계 버튼을 찾을 수 없습니다.")
         return False
 
-    import json as _json
-    pos = _json.loads(result)
+    pos = json.loads(result)
     _bring_chrome_front(rw)
     click_at(pos['sx'], pos['sy'])
     print(f"  다음단계 클릭! ({pos['sx']}, {pos['sy']})")
@@ -1269,29 +1215,77 @@ def run_full(skip_wait=False):
     """전체 플로우 실행"""
     global _log_t0, _log_t0_wall
 
-    if not skip_wait:
-        print("\n" + "=" * 50)
-        print("  Phase 0: 오픈 시간 대기")
-        print("=" * 50)
-        wait_for_open_time()
-
-    t_start = time.time()
-    _log_t0 = time.perf_counter()
-    _log_t0_wall = datetime.now()
-    tlog('run_start', mode='now' if skip_wait else 'scheduled')
-
-    # ── Phase 1: 예매하기 클릭 ──
+    # ── Phase 0: 버튼 상태 확인 → 필요 시에만 대기+새로고침 ──
     print("\n" + "=" * 50)
-    print("  Phase 1: 예매하기 클릭")
+    print("  Phase 0: 버튼 상태 확인")
     print("=" * 50)
-    tlog('phase1_start')
 
-    need_reload = skip_wait
-    tlog('phase1_reload', do_reload=need_reload)
-    if not phase1_click_reserve(do_reload=need_reload):
-        tlog('phase1_polling_start')
+    pre_check = phase1_click_reserve(do_reload=False)
+
+    if pre_check == 'clicked':
+        # 이미 "예매하기"(검정) → 대기/새로고침 불필요, 바로 진행
+        print("  이미 오픈됨! 바로 예매 진행")
+        t_start = time.time()
+        _log_t0 = time.perf_counter()
+        _log_t0_wall = datetime.now()
+        tlog('run_start', mode='already_open')
+        tlog('phase1_button_found', attempt=0)
+        tlog('phase1_end')
+
+    elif pre_check == 'not_open_yet':
+        # "판매예정"(회색) → 오픈 시간 대기 + 새로고침
+        print("  판매예정 상태 → 오픈 시간에 새로고침 필요")
+        if not skip_wait:
+            print("\n" + "=" * 50)
+            print("  Phase 0: 오픈 시간 대기")
+            print("=" * 50)
+            wait_for_open_time()
+
+        t_start = time.time()
+        _log_t0 = time.perf_counter()
+        _log_t0_wall = datetime.now()
+        tlog('run_start', mode='after_wait')
+
+        print("\n" + "=" * 50)
+        print("  Phase 1: 예매하기 클릭 (새로고침)")
+        print("=" * 50)
+        tlog('phase1_start')
+
         for attempt in range(60):
-            if phase1_click_reserve(do_reload=False):
+            r = phase1_click_reserve(do_reload=True)
+            if r == 'clicked':
+                tlog('phase1_button_found', attempt=attempt, after_reload=True)
+                break
+            time.sleep(0.5)
+        else:
+            tlog('phase1_fail')
+            print("  예매하기 버튼을 찾을 수 없습니다. 종료.")
+            save_log()
+            return
+        tlog('phase1_end')
+
+    else:
+        # 버튼 자체를 못 찾음 (페이지 로딩 중이거나 날짜 불일치)
+        if not skip_wait:
+            print("  버튼 못 찾음. 오픈 시간 대기 후 재시도")
+            print("\n" + "=" * 50)
+            print("  Phase 0: 오픈 시간 대기")
+            print("=" * 50)
+            wait_for_open_time()
+
+        t_start = time.time()
+        _log_t0 = time.perf_counter()
+        _log_t0_wall = datetime.now()
+        tlog('run_start', mode='not_found_retry')
+
+        print("\n" + "=" * 50)
+        print("  Phase 1: 예매하기 클릭")
+        print("=" * 50)
+        tlog('phase1_start')
+
+        for attempt in range(60):
+            r = phase1_click_reserve(do_reload=(attempt == 0))
+            if r == 'clicked':
                 tlog('phase1_button_found', attempt=attempt)
                 break
             time.sleep(0.05)
@@ -1300,9 +1294,7 @@ def run_full(skip_wait=False):
             print("  예매하기 버튼을 찾을 수 없습니다. 종료.")
             save_log()
             return
-    else:
-        tlog('phase1_button_found', attempt=0)
-    tlog('phase1_end')
+        tlog('phase1_end')
 
     # ── Phase 1.5: 보안문자 ──
     print("\n" + "=" * 50)
@@ -1378,16 +1370,13 @@ def run_full(skip_wait=False):
     time.sleep(0.1)
     tlog('phase2_canvas_loaded')
 
-    cached_canvas = _get_canvas_region() or region
+    cached_canvas = _get_canvas_region(rw2, rt2) or region
     print(f"  캔버스 위치: {cached_canvas}")
     tlog('phase2_canvas_region', region=cached_canvas)
 
-    # 다음단계 버튼 좌표 미리 캐싱
+    # 다음단계 버튼 좌표 미리 캐싱 (rw2, rt2 재사용)
     next_btn_pos = None
-    rw3, rt3 = find_ticketlink_window()
-    if rw3 == 0:
-        rw3, rt3 = find_any_ticketlink()
-    if rw3 > 0:
+    if rw2 > 0:
         js_btn = '''
         (function() {
             var btns = document.querySelectorAll('button, a, input[type="button"]');
@@ -1407,10 +1396,9 @@ def run_full(skip_wait=False):
             return 'not_found';
         })();
         '''
-        result = run_direct_js(js_btn, rw3, rt3)
+        result = run_direct_js(js_btn, rw2, rt2)
         if result and result != 'not_found':
-            import json as _json
-            next_btn_pos = _json.loads(result)
+            next_btn_pos = json.loads(result)
             print(f"  다음단계 버튼 위치 캐싱: ({next_btn_pos['sx']},{next_btn_pos['sy']})")
     tlog('phase2_end', next_btn_cached=next_btn_pos is not None)
 
@@ -1638,7 +1626,7 @@ end tell'''
 
         # Phase 1: 예매하기 클릭
         print("\n── Phase 1: 예매하기 클릭 ──")
-        if not phase1_click_reserve():
+        if phase1_click_reserve() != 'clicked':
             print("  예매하기 실패!")
             sys.exit(1)
         time.sleep(0.3)
@@ -1692,6 +1680,7 @@ end tell'''
                 time.sleep(0.05)
         if rw == 0:
             for attempt in range(60):
+                _refresh_tab_cache(force=True)
                 rw, rt = find_ticketlink_window()
                 if rw > 0:
                     break
@@ -1780,7 +1769,7 @@ end tell'''
                         time.sleep(0.05)
                     time.sleep(0.3)
 
-                    cached_canvas = _get_canvas_region() or region
+                    cached_canvas = _get_canvas_region(rw, rt) or region
                     print(f"  캔버스 위치: {cached_canvas}")
 
                     # 좌석 스캔 + 클릭
