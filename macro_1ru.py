@@ -70,9 +70,9 @@ def save_log():
     print(f"  요약 저장: {summary_path}")
 
 # ==================== 설정 ====================
-TARGET_DATE = "04.02"           # 예매할 경기 날짜 (페이지에 표시되는 형식)
-GRADE_NAME = "3루 응원단석"      # 등급 이름
-TARGET_SECTION = "118"           # 우선 선택할 구역 (117, 118, 119 중)
+TARGET_DATE = "04.10"           # 예매할 경기 날짜 (페이지에 표시되는 형식)
+GRADE_NAME = "1루 응원단석"      # 등급 이름
+TARGET_SECTION = "106"           # 우선 선택할 구역
 SEAT_COUNT = 3                   # 연속 좌석 수
 OPEN_TIME = "11:00:00"           # 판매 오픈 시간
 NEXT_BTN_POS = (908, 920)        # 다음단계 버튼 고정 좌표
@@ -89,7 +89,7 @@ target_color = SEAT_COLOR
 tolerance = SEAT_TOLERANCE
 min_seat_size = 6
 max_seat_size = 25
-region = (273, 416, 188, 389)
+region = (20, 340, 680, 604)
 
 # OCR 엔진 미리 로딩 (캡차 인식용)
 print("OCR 엔진 로딩 중...")
@@ -696,64 +696,99 @@ def phase2_select_grade_and_section():
             print("  좌석 선택 페이지를 찾을 수 없습니다!")
             return False
 
-    # 등급 로딩 대기 + 클릭 통합 (AppleScript 1회로 polling+클릭)
-    js_grade = f'''
-    (function() {{
-        var grades = document.querySelectorAll('[ng-click*="select.select"]');
-        for (var i = 0; i < grades.length; i++) {{
-            if (grades[i].innerText.indexOf('{GRADE_NAME}') > -1) {{
-                grades[i].click();
-                return 'grade_clicked:' + grades[i].innerText.substring(0,30).replace(/\\n/g,' ');
-            }}
-        }}
-        return 'grade_not_found:count=' + grades.length;
-    }})();
-    '''
-    for _ in range(60):
-        result = run_direct_js(js_grade, rw, rt)
-        if result.startswith("grade_clicked"):
-            break
-        time.sleep(0.05)
-    else:
-        print("  등급 목록 로딩 타임아웃")
-        return False
-    print(f"  등급 선택: {result}")
+    # 등급 → 구역 선택 fallback 체인
+    # 우선 구역 리스트: 순서대로 시도, 전부 실패 시 좌석 수 가장 많은 구역
+    GRADE_CHAIN = [
+        ("1루 응원단석", ["106", "103"], 3),
+        ("중앙탁자석", ["100B", "100C", "100A"], 3),
+        ("중앙지정석", ["100B"], 3),
+        ("1루 내야지정석", ["110", "102"], 3),
+    ]
 
-    # 구역 로딩 대기 + 클릭 통합 (polling+클릭 1회)
-    js_section = f'''
-    (function() {{
-        var zones = document.querySelectorAll('[ng-click*="grade.select"]');
-        var target = '{TARGET_SECTION}';
-        var fallback = null;
-        var clicked = null;
-        for (var i = 0; i < zones.length; i++) {{
-            var text = zones[i].innerText;
-            if (text.indexOf('구역') === -1) continue;
-            var match = text.match(/(\\d+)\\s*석/);
-            if (!match || parseInt(match[1]) <= 0) continue;
-            if (text.indexOf(target + '구역') > -1) {{
-                zones[i].click();
-                clicked = 'section_clicked:' + text.trim().replace(/\\n/g, ' ');
-                break;
+    def _try_grade_and_section(grade_name, pref_sections, min_seats, rw, rt):
+        """등급 클릭 → 구역 선택. 성공 시 True"""
+        js_grade = f'''
+        (function() {{
+            var grades = document.querySelectorAll('[ng-click*="select.select"]');
+            for (var i = 0; i < grades.length; i++) {{
+                if (grades[i].innerText.indexOf('{grade_name}') > -1) {{
+                    grades[i].click();
+                    return 'grade_clicked:' + grades[i].innerText.substring(0,30).replace(/\\n/g,' ');
+                }}
             }}
-            if (!fallback) fallback = zones[i];
-        }}
-        if (!clicked && fallback) {{
-            fallback.click();
-            clicked = 'section_clicked(fallback):' + fallback.innerText.trim().replace(/\\n/g, ' ').substring(0,50);
-        }}
-        return clicked || 'not_ready';
-    }})();
-    '''
-    for _ in range(40):
-        result = run_direct_js(js_section, rw, rt)
-        if result.startswith("section_clicked"):
-            break
-        time.sleep(0.05)
-    else:
-        print("  빈 구역이 없습니다!")
+            return 'grade_not_found';
+        }})();
+        '''
+        for _ in range(60):
+            result = run_direct_js(js_grade, rw, rt)
+            if result.startswith("grade_clicked"):
+                break
+            time.sleep(0.05)
+        else:
+            return False
+        print(f"  등급 선택: {result}")
+
+        prefs_js = json.dumps(pref_sections)
+        # 첫 번째 우선 구역으로 등급 전환 확인 (이전 등급 구역이 남아있는지 판별)
+        first_pref = pref_sections[0] if pref_sections else ""
+        js_section = f'''
+        (function() {{
+            // 현재 선택된 등급 확인 (active/selected 클래스)
+            var activeGrade = document.querySelector('[ng-click*="select.select"].active, [ng-click*="select.select"].on');
+            if (activeGrade && activeGrade.innerText.indexOf('{grade_name}') === -1) return 'not_ready';
+            var zones = document.querySelectorAll('[ng-click*="grade.select"]');
+            if (zones.length === 0) return 'not_ready';
+            var prefs = {prefs_js};
+            var bestFallback = null;
+            var bestCount = 0;
+            var zoneMap = {{}};
+            var totalZones = 0;
+            for (var i = 0; i < zones.length; i++) {{
+                var text = zones[i].innerText;
+                if (text.indexOf('구역') > -1) totalZones++;
+                var match = text.match(/(\\d+)\\s*석/);
+                if (!match || parseInt(match[1]) < {min_seats}) continue;
+                var cnt = parseInt(match[1]);
+                for (var p = 0; p < prefs.length; p++) {{
+                    if (text.indexOf(prefs[p] + '구역') > -1) {{
+                        zoneMap[prefs[p]] = zones[i];
+                    }}
+                }}
+                if (cnt > bestCount) {{ bestCount = cnt; bestFallback = zones[i]; }}
+            }}
+            var clicked = null;
+            for (var p = 0; p < prefs.length; p++) {{
+                if (zoneMap[prefs[p]]) {{
+                    zoneMap[prefs[p]].click();
+                    clicked = 'section_clicked:' + zoneMap[prefs[p]].innerText.trim().replace(/\\n/g, ' ');
+                    break;
+                }}
+            }}
+            if (!clicked && bestFallback) {{
+                bestFallback.click();
+                clicked = 'section_clicked(best):' + bestFallback.innerText.trim().replace(/\\n/g, ' ').substring(0,50);
+            }}
+            return clicked || (totalZones > 0 ? 'no_seats' : 'not_ready');
+        }})();
+        '''
+        for _ in range(20):
+            result = run_direct_js(js_section, rw, rt)
+            if result.startswith("section_clicked"):
+                print(f"  구역 선택: {result}")
+                return True
+            if result == 'no_seats':
+                print(f"  → {grade_name}: 좌석 부족 (< {min_seats}석)")
+                return False
+            time.sleep(0.05)
         return False
-    print(f"  구역 선택: {result}")
+
+    for grade_name, pref_sections, min_s in GRADE_CHAIN:
+        print(f"  시도: {grade_name} (우선: {pref_sections})")
+        if _try_grade_and_section(grade_name, pref_sections, min_s, rw, rt):
+            break
+    else:
+        print("  모든 등급에서 좌석을 찾을 수 없습니다!")
+        return False
 
     return True
 
