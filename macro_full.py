@@ -17,6 +17,58 @@ import numpy as np
 from collections import defaultdict
 import ddddocr
 
+# ==================== 타이밍 로그 ====================
+_log_entries = []
+_log_t0 = None  # run_full 시작 시점 (perf_counter)
+_log_t0_wall = None  # run_full 시작 시점 (wall clock)
+
+def tlog(event, **kwargs):
+    """타이밍 로그 기록. 콘솔 출력은 안 함, 파일에만 저장."""
+    now_pc = time.perf_counter()
+    now_wall = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    elapsed = (now_pc - _log_t0) * 1000 if _log_t0 else 0
+    entry = {
+        'time': now_wall,
+        'elapsed_ms': round(elapsed, 1),
+        'event': event,
+    }
+    entry.update(kwargs)
+    _log_entries.append(entry)
+
+def save_log():
+    """로그를 파일로 저장"""
+    if not _log_entries:
+        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"log_{ts}.json"
+    filepath = os.path.join(os.path.dirname(__file__) or '.', filename)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(_log_entries, f, ensure_ascii=False, indent=2)
+    print(f"\n  로그 저장: {filepath} ({len(_log_entries)}건)")
+
+    # 요약도 텍스트로 저장
+    summary_path = filepath.replace('.json', '.txt')
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        f.write(f"=== 티켓 매크로 실행 로그 ({ts}) ===\n\n")
+        phases = {}
+        for e in _log_entries:
+            f.write(f"[{e['time']}] +{e['elapsed_ms']:>8.1f}ms  {e['event']}")
+            extras = {k: v for k, v in e.items() if k not in ('time', 'elapsed_ms', 'event')}
+            if extras:
+                f.write(f"  {extras}")
+            f.write("\n")
+            # phase별 시간 집계
+            ev = e['event']
+            if ev.startswith('phase') and ev.endswith('_start'):
+                phases[ev.replace('_start', '')] = e['elapsed_ms']
+            elif ev.startswith('phase') and ev.endswith('_end'):
+                phase = ev.replace('_end', '')
+                if phase in phases:
+                    duration = e['elapsed_ms'] - phases[phase]
+                    f.write(f"  >>> {phase} 소요: {duration:.0f}ms\n")
+        f.write(f"\n총 소요: {_log_entries[-1]['elapsed_ms']:.0f}ms\n")
+    print(f"  요약 저장: {summary_path}")
+
 # ==================== 설정 ====================
 TARGET_DATE = "04.02"           # 예매할 경기 날짜 (페이지에 표시되는 형식)
 GRADE_NAME = "3루 응원단석"      # 등급 이름
@@ -94,39 +146,34 @@ def run_direct_js(js_code, window=1, tab=1):
 
 
 # ==================== 좌석 탐색 (픽셀 기반) ====================
+from scipy.ndimage import label as _ndlabel, find_objects as _nd_find_objects
+
 def find_seats(img):
-    h, w = img.shape[:2]
     diff = np.abs(img.astype(int) - np.array(target_color, dtype=int))
     mask = np.all(diff <= tolerance, axis=2)
     if not mask.any():
         return []
-    visited = np.zeros_like(mask)
+    labeled, num = _ndlabel(mask)
+    if num == 0:
+        return []
     seats = []
-    for y in range(h):
-        for x in range(w):
-            if mask[y, x] and not visited[y, x]:
-                stack = [(y, x)]
-                pixels = []
-                while stack:
-                    cy, cx = stack.pop()
-                    if cy < 0 or cy >= h or cx < 0 or cx >= w:
-                        continue
-                    if visited[cy, cx] or not mask[cy, cx]:
-                        continue
-                    visited[cy, cx] = True
-                    pixels.append((cx, cy))
-                    stack.extend([(cy+1, cx), (cy-1, cx), (cy, cx+1), (cy, cx-1)])
-                if len(pixels) < min_seat_size * min_seat_size * 0.5:
-                    continue
-                xs = [p[0] for p in pixels]
-                ys = [p[1] for p in pixels]
-                cx_val = (min(xs) + max(xs)) // 2
-                cy_val = (min(ys) + max(ys)) // 2
-                sw = max(xs) - min(xs) + 1
-                sh = max(ys) - min(ys) + 1
-                if sw > max_seat_size * 2 or sh > max_seat_size * 2:
-                    continue
-                seats.append({'cx': cx_val, 'cy': cy_val, 'w': sw, 'h': sh, 'pixels': len(pixels)})
+    slices = _nd_find_objects(labeled)
+    for i, sl in enumerate(slices):
+        if sl is None:
+            continue
+        region = labeled[sl] == (i + 1)
+        px_count = region.sum()
+        if px_count < min_seat_size * min_seat_size * 0.5:
+            continue
+        y_sl, x_sl = sl
+        sw = x_sl.stop - x_sl.start
+        sh = y_sl.stop - y_sl.start
+        if sw > max_seat_size * 2 or sh > max_seat_size * 2:
+            continue
+        ys, xs = np.where(region)
+        cx_val = x_sl.start + (xs.min() + xs.max()) // 2
+        cy_val = y_sl.start + (ys.min() + ys.max()) // 2
+        seats.append({'cx': cx_val, 'cy': cy_val, 'w': sw, 'h': sh, 'pixels': int(px_count)})
     return seats
 
 
@@ -788,7 +835,7 @@ def phase3_scan_and_click(cached_region=None):
         time.sleep(0.25)
 
     # 다음단계
-    time.sleep(0.25)
+    time.sleep(0.35)
     click_at(NEXT_BTN_POS[0], NEXT_BTN_POS[1])
     print(f"  다음단계 클릭! {NEXT_BTN_POS}")
     return True
@@ -1172,13 +1219,26 @@ def wait_for_open_time():
         print(f"  대략→정밀 차이: {improvement:.1f}ms")
 
         # 정밀 offset으로 타겟 시각 재계산
+        # AppleScript 오버헤드(~150ms)를 감안하여 일찍 시작
+        # reload() 후 HTTP 요청이 서버에 도착하는 시점이 11:00:00 + 30ms가 되도록
+        APPLESCRIPT_OVERHEAD = 0.150  # ~150ms
+        SAFETY_MARGIN = 0.030        # +30ms (서버 처리 시간 마진)
+        early_start = APPLESCRIPT_OVERHEAD - SAFETY_MARGIN  # 120ms 일찍
+
         target_perf = time.perf_counter() + (target_ts - (time.time() + precise_offset))
+        reload_perf = target_perf - early_start  # 새로고침 발사 시점
         remaining = target_perf - time.perf_counter()
         print(f"\n  오픈까지 {remaining:.2f}초 (정밀 기준)")
+        print(f"  새로고침 예정: 오픈 {early_start*1000:.0f}ms 전 발사 → 서버 도착 ~오픈+{SAFETY_MARGIN*1000:.0f}ms")
+
+        # 스케줄 창 미리 찾아두기 (AppleScript 1회 절약)
+        _pre_sw, _pre_st = find_schedule_window()
+        if _pre_sw > 0:
+            print(f"  스케줄 페이지 미리 확인: window {_pre_sw}, tab {_pre_st}")
 
         # 50ms 전까지 sleep
         while True:
-            remaining = target_perf - time.perf_counter()
+            remaining = reload_perf - time.perf_counter()
             if remaining <= 0.05:
                 break
             if remaining > 1:
@@ -1190,11 +1250,16 @@ def wait_for_open_time():
 
         # 마지막 50ms: spin-wait (perf_counter 기반)
         print("  spin-wait 진입...")
-        while time.perf_counter() < target_perf:
+        while time.perf_counter() < reload_perf:
             pass
 
-        overshoot = (time.perf_counter() - target_perf) * 1000
-        print(f"  GO! (overshoot: {overshoot:.2f}ms)")
+        overshoot = (time.perf_counter() - reload_perf) * 1000
+        print(f"  새로고침 발사! (overshoot: {overshoot:.2f}ms)")
+
+        # 즉시 새로고침 (스케줄 창을 미리 찾아뒀으므로 find 생략)
+        if _pre_sw > 0:
+            run_direct_js("location.reload();", _pre_sw, _pre_st)
+            print(f"  reload 완료 → 서버 11:00:00 +{SAFETY_MARGIN*1000:.0f}ms 부근 도착 예상")
 
     except KeyboardInterrupt:
         print("\n  대기 취소! 바로 시작합니다.")
@@ -1202,6 +1267,8 @@ def wait_for_open_time():
 
 def run_full(skip_wait=False):
     """전체 플로우 실행"""
+    global _log_t0, _log_t0_wall
+
     if not skip_wait:
         print("\n" + "=" * 50)
         print("  Phase 0: 오픈 시간 대기")
@@ -1209,32 +1276,40 @@ def run_full(skip_wait=False):
         wait_for_open_time()
 
     t_start = time.time()
+    _log_t0 = time.perf_counter()
+    _log_t0_wall = datetime.now()
+    tlog('run_start', mode='now' if skip_wait else 'scheduled')
 
+    # ── Phase 1: 예매하기 클릭 ──
     print("\n" + "=" * 50)
     print("  Phase 1: 예매하기 클릭")
     print("=" * 50)
+    tlog('phase1_start')
 
-    # 새로고침 없이 DOM polling으로 예매하기 버튼 감지 (대기열 회피)
-    # 11시 되면 서버에서 버튼 상태가 바뀌므로, 페이지 내 JS로 반복 체크
-    for attempt in range(30):
-        if phase1_click_reserve(do_reload=False):
-            break
-        if attempt == 15:
-            # 15회 실패 시 한 번만 새로고침 시도
-            print("  DOM에서 못 찾음, 새로고침 1회 시도...")
-            if phase1_click_reserve(do_reload=True):
+    need_reload = skip_wait
+    tlog('phase1_reload', do_reload=need_reload)
+    if not phase1_click_reserve(do_reload=need_reload):
+        tlog('phase1_polling_start')
+        for attempt in range(60):
+            if phase1_click_reserve(do_reload=False):
+                tlog('phase1_button_found', attempt=attempt)
                 break
-        print(f"  대기 {attempt+1}... (새로고침 없이 DOM 체크)")
-        time.sleep(0.3)
+            time.sleep(0.05)
+        else:
+            tlog('phase1_fail')
+            print("  예매하기 버튼을 찾을 수 없습니다. 종료.")
+            save_log()
+            return
     else:
-        print("  예매하기 버튼을 찾을 수 없습니다. 종료.")
-        return
+        tlog('phase1_button_found', attempt=0)
+    tlog('phase1_end')
 
-    # 캡차 확인 (보안문자가 있으면 풀기)
+    # ── Phase 1.5: 보안문자 ──
     print("\n" + "=" * 50)
     print("  Phase 1.5: 보안문자 확인")
     print("=" * 50)
-    # 캡차 로딩 polling (최소 0.5초 대기 후 판단)
+    tlog('phase1_5_start')
+
     captcha_found = False
     for i in range(20):
         rw, rt = _find_captcha_tab()
@@ -1256,29 +1331,42 @@ def run_full(skip_wait=False):
         time.sleep(0.1)
         if not captcha_found and i >= 5:
             break
+
+    tlog('phase1_5_captcha_detected', found=captcha_found)
+
     if captcha_found:
         print("  보안문자 발견! 자동 풀기 시도...")
         for cap_attempt in range(3):
+            tlog('captcha_attempt', attempt=cap_attempt + 1)
             if solve_captcha():
+                tlog('captcha_pass', attempt=cap_attempt + 1)
                 break
             print(f"  캡차 재시도 {cap_attempt+1}...")
             time.sleep(1)
         else:
+            tlog('captcha_fail')
             print("  캡차 자동 풀기 실패. 수동으로 입력하세요.")
             input("  입력 후 Enter...")
     else:
         print("  보안문자 없음, 계속 진행")
+    tlog('phase1_5_end')
 
+    # ── Phase 2: 등급/구역 선택 ──
     print("\n" + "=" * 50)
     print("  Phase 2: 등급/구역 선택")
     print("=" * 50)
+    tlog('phase2_start')
 
     if not phase2_select_grade_and_section():
+        tlog('phase2_fail')
         print("  등급/구역 선택 실패. 종료.")
+        save_log()
         return
+    tlog('phase2_grade_section_done')
 
-    # 좌석 지도 로딩 대기 (canvas 감지 polling)
+    # 좌석 지도 로딩 대기
     print("  좌석 지도 로딩 대기...")
+    tlog('phase2_canvas_wait_start')
     rw2, rt2 = find_ticketlink_window()
     if rw2 == 0:
         rw2, rt2 = find_any_ticketlink()
@@ -1288,10 +1376,11 @@ def run_full(skip_wait=False):
             break
         time.sleep(0.05)
     time.sleep(0.1)
+    tlog('phase2_canvas_loaded')
 
-    # 캔버스 위치 캐싱 (Chrome은 이미 활성 상태)
     cached_canvas = _get_canvas_region() or region
     print(f"  캔버스 위치: {cached_canvas}")
+    tlog('phase2_canvas_region', region=cached_canvas)
 
     # 다음단계 버튼 좌표 미리 캐싱
     next_btn_pos = None
@@ -1323,35 +1412,44 @@ def run_full(skip_wait=False):
             import json as _json
             next_btn_pos = _json.loads(result)
             print(f"  다음단계 버튼 위치 캐싱: ({next_btn_pos['sx']},{next_btn_pos['sy']})")
+    tlog('phase2_end', next_btn_cached=next_btn_pos is not None)
 
+    # ── Phase 3: 좌석 스캔 + 클릭 ──
     if ASSIST_MODE:
         print("\n" + "=" * 50)
         print("  Phase 3+4: 어시스트 모드 (좌석 1개 클릭하세요)")
         print("=" * 50)
+        tlog('phase3_start', mode='assist')
         if not phase3_assist_mode():
+            tlog('phase3_fail')
             print("  어시스트 실패. 수동으로 진행하세요.")
+            save_log()
             return
     else:
         print("\n" + "=" * 50)
         print("  Phase 3: 좌석 스캔 + 클릭")
         print("=" * 50)
+        tlog('phase3_start', mode='auto')
         for attempt in range(5):
             if phase3_scan_and_click(cached_region=cached_canvas):
+                tlog('phase3_seats_clicked', attempt=attempt + 1)
                 break
             print(f"  재스캔 {attempt+1}...")
             time.sleep(0.3)
         else:
+            tlog('phase3_fail')
             print("  좌석을 찾을 수 없습니다. 수동으로 선택하세요.")
-            elapsed = time.time() - t_start
-            print(f"\n  경과 시간: {elapsed:.1f}초")
+            save_log()
             return
 
-        # phase3에서 이미 다음단계 클릭함
+    tlog('phase3_end')
 
     elapsed = time.time() - t_start
+    tlog('run_end', total_sec=round(elapsed, 1))
     print(f"\n{'=' * 50}")
     print(f"  완료! 총 {elapsed:.1f}초")
     print(f"{'=' * 50}")
+    save_log()
 
 
 # ==================== 시작 ====================
