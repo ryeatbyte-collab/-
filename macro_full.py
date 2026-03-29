@@ -17,7 +17,8 @@ import ddddocr
 
 # ==================== 설정 ====================
 TARGET_DATE = "04.02"           # 예매할 경기 날짜 (페이지에 표시되는 형식)
-GRADE_NAME = "1루 응원단석"      # 등급 이름
+GRADE_NAME = "3루 응원단석"      # 등급 이름
+TARGET_SECTION = "118"           # 우선 선택할 구역 (117, 118, 119 중)
 SEAT_COUNT = 3                   # 연속 좌석 수
 OPEN_TIME = "11:00:00"           # 판매 오픈 시간
 
@@ -588,48 +589,51 @@ def phase2_select_grade_and_section():
     # 페이지 로딩 대기
     time.sleep(2)
 
-    # 1루 응원단석 클릭
+    # 등급 클릭 (run_direct_js 사용 — run_page_js의 base64/atob는 한글 깨짐)
     js_grade = f'''
-    var grades = document.querySelectorAll('[ng-click*="select.select"]');
-    var clicked = false;
-    for (var i = 0; i < grades.length; i++) {{
-        if (grades[i].innerText.indexOf('{GRADE_NAME}') > -1) {{
-            grades[i].click();
-            clicked = true;
-            break;
+    (function() {{
+        var grades = document.querySelectorAll('[ng-click*="select.select"]');
+        for (var i = 0; i < grades.length; i++) {{
+            if (grades[i].innerText.indexOf('{GRADE_NAME}') > -1) {{
+                grades[i].click();
+                return 'grade_clicked:' + grades[i].innerText.substring(0,30).replace(/\\n/g,' ');
+            }}
         }}
-    }}
-    document.getElementById('__mr').setAttribute('data-r', clicked ? 'grade_clicked' : 'grade_not_found');
+        return 'grade_not_found:count=' + grades.length;
+    }})();
     '''
-    result = run_page_js(js_grade, rw, rt)
+    result = run_direct_js(js_grade, rw, rt)
     print(f"  등급 선택: {result}")
-    if result != "grade_clicked":
+    if not result.startswith("grade_clicked"):
         return False
 
     time.sleep(1)
 
-    # 빈 구역 찾아서 클릭 (남은석 > 0인 구역)
-    js_section = '''
-    var sections = document.querySelectorAll('[ng-click*="select.select"]');
-    var clicked = false;
-    for (var i = 0; i < sections.length; i++) {
-        var text = sections[i].innerText;
-        // "카스존 10X구역" 또는 "10X구역" 패턴이면서 0석이 아닌 것
-        if ((text.indexOf('구역') > -1) && text.indexOf('0 석') === -1) {
+    # 타겟 구역(118) 우선 선택 — 구역은 ng-click="grade.select(...)"
+    js_section = f'''
+    (function() {{
+        var zones = document.querySelectorAll('[ng-click*="grade.select"]');
+        var target = '{TARGET_SECTION}';
+        var fallback = null;
+        for (var i = 0; i < zones.length; i++) {{
+            var text = zones[i].innerText;
+            if (text.indexOf('구역') === -1) continue;
             var match = text.match(/(\\d+)\\s*석/);
-            if (match && parseInt(match[1]) > 0) {
-                sections[i].click();
-                document.getElementById('__mr').setAttribute('data-r', 'section_clicked:' + text.trim().replace(/\\n/g, ' '));
-                clicked = true;
-                break;
-            }
-        }
-    }
-    if (!clicked) {
-        document.getElementById('__mr').setAttribute('data-r', 'no_available_section');
-    }
+            if (!match || parseInt(match[1]) <= 0) continue;
+            if (text.indexOf(target + '구역') > -1) {{
+                zones[i].click();
+                return 'section_clicked:' + text.trim().replace(/\\n/g, ' ');
+            }}
+            if (!fallback) fallback = zones[i];
+        }}
+        if (fallback) {{
+            fallback.click();
+            return 'section_clicked(fallback):' + fallback.innerText.trim().replace(/\\n/g, ' ').substring(0,50);
+        }}
+        return 'no_available_section';
+    }})();
     '''
-    result = run_page_js(js_section, rw, rt)
+    result = run_direct_js(js_section, rw, rt)
     print(f"  구역 선택: {result}")
 
     if not result.startswith("section_clicked"):
@@ -640,34 +644,47 @@ def phase2_select_grade_and_section():
 
     # 직접선택 팝업이 뜨면 클릭
     js_direct = '''
-    var popup = document.querySelector('[ng-click*="btnClick"][ng-click*="SELF"]');
-    if (!popup) {
-        // 다른 방식으로 직접선택 버튼 찾기
-        var btns = document.querySelectorAll('[ng-click*="btnClick"]');
-        for (var i = 0; i < btns.length; i++) {
-            if (btns[i].innerText.indexOf('직접선택') > -1 || btns[i].innerText.indexOf('직접') > -1) {
-                popup = btns[i];
-                break;
+    (function() {
+        var popup = document.querySelector('[ng-click*="btnClick"][ng-click*="SELF"]');
+        if (!popup) {
+            var btns = document.querySelectorAll('[ng-click*="btnClick"]');
+            for (var i = 0; i < btns.length; i++) {
+                if (btns[i].innerText.indexOf('직접선택') > -1 || btns[i].innerText.indexOf('직접') > -1) {
+                    popup = btns[i]; break;
+                }
             }
         }
-    }
-    if (popup) {
-        popup.click();
-        document.getElementById('__mr').setAttribute('data-r', 'direct_clicked');
-    } else {
-        // 팝업 없이 바로 좌석 선택 가능한 경우
-        document.getElementById('__mr').setAttribute('data-r', 'no_popup');
-    }
+        if (popup) { popup.click(); return 'direct_clicked'; }
+        return 'no_popup';
+    })();
     '''
-    result = run_page_js(js_direct, rw, rt)
+    result = run_direct_js(js_direct, rw, rt)
     print(f"  직접선택: {result}")
 
     return True
 
 
 # ==================== Phase 3: 좌석 스캔 + 클릭 ====================
+def _bring_chrome_front(window=1):
+    """Chrome 창을 최앞으로 가져오기"""
+    bring_as = f'''
+tell application "Google Chrome"
+    set index of window {window} to 1
+    activate
+end tell'''
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.applescript', delete=False) as f:
+        f.write(bring_as)
+        f.flush()
+        subprocess.run(["osascript", f.name], capture_output=True, timeout=5)
+        os.unlink(f.name)
+    time.sleep(0.3)
+
+
 def phase3_scan_and_click():
     """좌석 스캔 → 연속 3자리 클릭"""
+    # Chrome을 앞으로 가져와야 pynput 클릭이 캔버스에 닿음
+    _bring_chrome_front()
+
     print(f"\n  스캔 중... region={region}")
     screenshot = pyautogui.screenshot(region=region)
     img = np.array(screenshot.convert("RGB"))
@@ -695,26 +712,89 @@ def phase3_scan_and_click():
             real_y = region[1] + seat['cy']
             click_at(real_x, real_y)
             print(f"  좌석 {i+1}: ({real_x}, {real_y})")
-            time.sleep(0.2)
+            time.sleep(0.3)
         return True
     return False
 
 
-# ==================== Phase 4: 다음단계 ====================
-def phase4_next_step():
-    """다음단계 버튼 클릭"""
-    # 같은 탭에서 계속 진행되므로 reserve/plan/schedule URL이 있는 탭 찾기
+def _verify_seat_selection():
+    """좌석이 실제로 선택되었는지 확인 (tk.state.select.getTotalCnt)"""
     rw, rt = find_ticketlink_window()
     if rw == 0:
-        # 스케줄 탭이 전환됐을 수 있으므로 schedule URL도 확인
-        rw, rt = find_schedule_window()
+        rw, rt = find_any_ticketlink()
+    if rw == 0:
+        return 0
+
+    js = '''
+    try {
+        var count = 0;
+        if (typeof tk !== 'undefined' && tk.state && tk.state.select) {
+            if (typeof tk.state.select.getTotalCnt === 'function') {
+                count = tk.state.select.getTotalCnt();
+            }
+        }
+        document.getElementById('__mr').setAttribute('data-r', String(count));
+    } catch(e) {
+        document.getElementById('__mr').setAttribute('data-r', '0');
+    }
+    '''
+    result = run_page_js(js, rw, rt)
+    try:
+        return int(result)
+    except:
+        return 0
+
+
+# ==================== Phase 4: 다음단계 ====================
+def phase4_next_step():
+    """좌석 선택 확인 후 다음단계 버튼 클릭"""
+    # 선택 확인
+    count = _verify_seat_selection()
+    print(f"  선택된 좌석 수: {count}")
+
+    if count < SEAT_COUNT:
+        print(f"  좌석이 {SEAT_COUNT}석 선택되지 않았습니다! 다음단계 건너뜀.")
+        print("  수동으로 좌석을 선택한 후 다음단계를 눌러주세요.")
+        return False
+
+    rw, rt = find_ticketlink_window()
+    if rw == 0:
+        rw, rt = find_any_ticketlink()
         if rw == 0:
             print("  예매 창을 찾을 수 없습니다.")
-            return
+            return False
 
-    # JS로 다음단계 실행
-    run_page_js_fire("tk.state.view.nextStep();", rw, rt)
-    print("  다음단계 (JS)")
+    # 다음단계 버튼 위치 찾아서 실제 클릭 (JS 호출은 "요청 데이터 오류" 발생)
+    js_btn = '''
+    (function() {
+        var btns = document.querySelectorAll('button, a, input[type="button"]');
+        for (var i = 0; i < btns.length; i++) {
+            var t = (btns[i].innerText || btns[i].value || '').trim();
+            if (t === '다음단계' || t === '다음 단계') {
+                var rect = btns[i].getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    var tb = window.outerHeight - window.innerHeight;
+                    return JSON.stringify({
+                        sx: Math.round(window.screenX + rect.left + rect.width/2),
+                        sy: Math.round(window.screenY + tb + rect.top + rect.height/2)
+                    });
+                }
+            }
+        }
+        return 'not_found';
+    })();
+    '''
+    result = run_direct_js(js_btn, rw, rt)
+    if result == 'not_found':
+        print("  다음단계 버튼을 찾을 수 없습니다.")
+        return False
+
+    import json as _json
+    pos = _json.loads(result)
+    _bring_chrome_front(rw)
+    click_at(pos['sx'], pos['sy'])
+    print(f"  다음단계 클릭! ({pos['sx']}, {pos['sy']})")
+    return True
 
 
 # ==================== 메인 ====================
@@ -997,9 +1077,13 @@ end tell'''
         sys.exit(0)
 
     if len(sys.argv) > 1 and sys.argv[1] == "--now":
-        print("  --now: 대기 없이 바로 시작!")
+        print("  --now: 대기 없이 바로 시작! (run_full에서 오픈시간 대기만 건너뜀)")
+        # run_full과 동일한 흐름, 오픈시간 대기만 스킵
         t_start = time.time()
-        print("\n  Phase 1: 예매하기 클릭")
+
+        print("\n" + "=" * 50)
+        print("  Phase 1: 예매하기 클릭")
+        print("=" * 50)
         for attempt in range(30):
             if phase1_click_reserve(do_reload=False):
                 break
@@ -1011,17 +1095,66 @@ end tell'''
         else:
             print("  실패")
             sys.exit(1)
-        print("\n  Phase 2: 등급/구역 선택")
-        if phase2_select_grade_and_section():
-            time.sleep(2)
-            print("\n  Phase 3: 좌석 스캔 + 클릭")
-            for attempt in range(5):
-                if phase3_scan_and_click():
-                    break
-                time.sleep(1)
-            time.sleep(0.5)
-            print("\n  Phase 4: 다음단계")
-            phase4_next_step()
+
+        # 보안문자 (기존 run_full 흐름 그대로)
+        print("\n" + "=" * 50)
+        print("  Phase 1.5: 보안문자 확인")
+        print("=" * 50)
+        time.sleep(1)
+        rw, rt = _find_captcha_tab()
+        if rw > 0:
+            check_js = '''
+            try {
+                var canvas = document.getElementById('captcha_canvas');
+                var popup = document.querySelector('[ng-click*="popupCaptcha.auth"]');
+                document.getElementById('__mr').setAttribute('data-r',
+                    (canvas && canvas.width > 0) || popup ? 'captcha_found' : 'no_captcha');
+            } catch(e) {
+                document.getElementById('__mr').setAttribute('data-r', 'no_captcha');
+            }
+            '''
+            has_captcha = run_page_js(check_js, rw, rt)
+            if has_captcha == 'captcha_found':
+                print("  보안문자 발견! 자동 풀기 시도...")
+                for cap_attempt in range(3):
+                    if solve_captcha():
+                        break
+                    print(f"  캡차 재시도 {cap_attempt+1}...")
+                    time.sleep(1)
+                else:
+                    print("  캡차 자동 풀기 실패. 수동으로 입력하세요.")
+                    input("  입력 후 Enter...")
+            else:
+                print("  보안문자 없음, 계속 진행")
+
+        print("\n" + "=" * 50)
+        print("  Phase 2: 등급/구역 선택")
+        print("=" * 50)
+        if not phase2_select_grade_and_section():
+            print("  등급/구역 선택 실패. 종료.")
+            sys.exit(1)
+
+        print("  좌석 지도 로딩 대기...")
+        time.sleep(2)
+
+        print("\n" + "=" * 50)
+        print("  Phase 3: 좌석 스캔 + 클릭")
+        print("=" * 50)
+        for attempt in range(5):
+            if phase3_scan_and_click():
+                break
+            print(f"  재스캔 {attempt+1}...")
+            time.sleep(1)
+        else:
+            print("  좌석을 찾을 수 없습니다. 수동으로 선택하세요.")
+            sys.exit(1)
+
+        print("\n" + "=" * 50)
+        print("  Phase 4: 다음단계")
+        print("=" * 50)
+        time.sleep(0.5)
+        phase4_next_step()
+
         elapsed = time.time() - t_start
         print(f"\n  완료! {elapsed:.1f}초")
     else:
