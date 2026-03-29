@@ -163,11 +163,11 @@ mouse_controller = mouse.Controller()
 
 def click_at(x, y):
     mouse_controller.position = (x - 5, y)
-    time.sleep(0.01)
+    time.sleep(0.0005)
     mouse_controller.position = (x, y)
-    time.sleep(0.03)
+    time.sleep(0.00015)
     mouse_controller.press(mouse.Button.left)
-    time.sleep(0.01)
+    time.sleep(0.0005)
     mouse_controller.release(mouse.Button.left)
 
 
@@ -451,8 +451,11 @@ def solve_captcha():
         if not _type_captcha_fallback(text, rw, rt, t0):
             continue
 
-        # 4. 제출 결과 확인 — 팝업 사라지면 성공, 남아있으면 틀린 답
-        time.sleep(1.0)
+        # 4. 제출 결과 확인 — polling으로 빠르게 감지
+        for _ in range(20):
+            time.sleep(0.1)
+            if _is_captcha_done(rw, rt):
+                break
         if _is_captcha_done(rw, rt):
             print(f"  캡차 통과! {(time.time()-t0)*1000:.0f}ms")
             return True
@@ -514,7 +517,7 @@ end tell'''
             f.flush()
             subprocess.run(["osascript", f.name], capture_output=True, timeout=5)
             os.unlink(f.name)
-        time.sleep(0.1)
+        time.sleep(0.03)
         click_at(data['sx'], data['sy'])
         print(f"  입력 완료 클릭! {(time.time()-t0)*1000:.0f}ms")
         return True
@@ -616,7 +619,7 @@ def phase2_select_grade_and_section():
                 print(f"  좌석 선택 페이지 전환 확인: window {sw}, tab {st}")
                 rw, rt = sw, st
                 break
-            time.sleep(0.1)
+            time.sleep(0.05)
         else:
             # 혹시 새 창으로 열렸을 수도 있으니 확인
             rw, rt = find_ticketlink_window()
@@ -631,22 +634,12 @@ def phase2_select_grade_and_section():
             if rw > 0:
                 print(f"  좌석 선택 페이지 발견: window {rw}, tab {rt}")
                 break
-            time.sleep(0.1)
+            time.sleep(0.05)
         else:
             print("  좌석 선택 페이지를 찾을 수 없습니다!")
             return False
 
-    # 등급 목록 로딩 대기 (polling)
-    for _ in range(60):
-        count = _run_js("document.querySelectorAll('[ng-click*=\"select.select\"]').length;", rw, rt)
-        if count and int(count) > 0:
-            break
-        time.sleep(0.05)
-    else:
-        print("  등급 목록 로딩 타임아웃")
-        return False
-
-    # 등급 클릭 (run_direct_js 사용 — run_page_js의 base64/atob는 한글 깨짐)
+    # 등급 로딩 대기 + 클릭 통합 (AppleScript 1회로 polling+클릭)
     js_grade = f'''
     (function() {{
         var grades = document.querySelectorAll('[ng-click*="select.select"]');
@@ -659,24 +652,23 @@ def phase2_select_grade_and_section():
         return 'grade_not_found:count=' + grades.length;
     }})();
     '''
-    result = run_direct_js(js_grade, rw, rt)
-    print(f"  등급 선택: {result}")
-    if not result.startswith("grade_clicked"):
-        return False
-
-    # 구역 로딩 대기 (polling)
-    for _ in range(40):
-        count = _run_js("document.querySelectorAll('[ng-click*=\"grade.select\"]').length;", rw, rt)
-        if count and int(count) > 0:
+    for _ in range(60):
+        result = run_direct_js(js_grade, rw, rt)
+        if result.startswith("grade_clicked"):
             break
         time.sleep(0.05)
+    else:
+        print("  등급 목록 로딩 타임아웃")
+        return False
+    print(f"  등급 선택: {result}")
 
-    # 타겟 구역(118) 우선 선택 — 구역은 ng-click="grade.select(...)"
+    # 구역 로딩 대기 + 클릭 통합 (polling+클릭 1회)
     js_section = f'''
     (function() {{
         var zones = document.querySelectorAll('[ng-click*="grade.select"]');
         var target = '{TARGET_SECTION}';
         var fallback = null;
+        var clicked = null;
         for (var i = 0; i < zones.length; i++) {{
             var text = zones[i].innerText;
             if (text.indexOf('구역') === -1) continue;
@@ -684,44 +676,27 @@ def phase2_select_grade_and_section():
             if (!match || parseInt(match[1]) <= 0) continue;
             if (text.indexOf(target + '구역') > -1) {{
                 zones[i].click();
-                return 'section_clicked:' + text.trim().replace(/\\n/g, ' ');
+                clicked = 'section_clicked:' + text.trim().replace(/\\n/g, ' ');
+                break;
             }}
             if (!fallback) fallback = zones[i];
         }}
-        if (fallback) {{
+        if (!clicked && fallback) {{
             fallback.click();
-            return 'section_clicked(fallback):' + fallback.innerText.trim().replace(/\\n/g, ' ').substring(0,50);
+            clicked = 'section_clicked(fallback):' + fallback.innerText.trim().replace(/\\n/g, ' ').substring(0,50);
         }}
-        return 'no_available_section';
+        return clicked || 'not_ready';
     }})();
     '''
-    result = run_direct_js(js_section, rw, rt)
-    print(f"  구역 선택: {result}")
-
-    if not result.startswith("section_clicked"):
+    for _ in range(40):
+        result = run_direct_js(js_section, rw, rt)
+        if result.startswith("section_clicked"):
+            break
+        time.sleep(0.05)
+    else:
         print("  빈 구역이 없습니다!")
         return False
-
-    time.sleep(0.1)
-
-    # 직접선택 팝업이 뜨면 클릭
-    js_direct = '''
-    (function() {
-        var popup = document.querySelector('[ng-click*="btnClick"][ng-click*="SELF"]');
-        if (!popup) {
-            var btns = document.querySelectorAll('[ng-click*="btnClick"]');
-            for (var i = 0; i < btns.length; i++) {
-                if (btns[i].innerText.indexOf('직접선택') > -1 || btns[i].innerText.indexOf('직접') > -1) {
-                    popup = btns[i]; break;
-                }
-            }
-        }
-        if (popup) { popup.click(); return 'direct_clicked'; }
-        return 'no_popup';
-    })();
-    '''
-    result = run_direct_js(js_direct, rw, rt)
-    print(f"  직접선택: {result}")
+    print(f"  구역 선택: {result}")
 
     return True
 
@@ -1079,32 +1054,40 @@ def run_full(skip_wait=False):
     print("\n" + "=" * 50)
     print("  Phase 1.5: 보안문자 확인")
     print("=" * 50)
-    time.sleep(1)
-    rw, rt = _find_captcha_tab()
-    if rw > 0:
-        check_js = '''
-        try {
-            var canvas = document.getElementById('captcha_canvas');
-            var popup = document.querySelector('[ng-click*="popupCaptcha.auth"]');
-            document.getElementById('__mr').setAttribute('data-r',
-                (canvas && canvas.width > 0) || popup ? 'captcha_found' : 'no_captcha');
-        } catch(e) {
-            document.getElementById('__mr').setAttribute('data-r', 'no_captcha');
-        }
-        '''
-        has_captcha = run_page_js(check_js, rw, rt)
-        if has_captcha == 'captcha_found':
-            print("  보안문자 발견! 자동 풀기 시도...")
-            for cap_attempt in range(3):
-                if solve_captcha():
-                    break
-                print(f"  캡차 재시도 {cap_attempt+1}...")
-                time.sleep(1)
-            else:
-                print("  캡차 자동 풀기 실패. 수동으로 입력하세요.")
-                input("  입력 후 Enter...")
+    # 캡차 로딩 polling (최소 0.5초 대기 후 판단)
+    captcha_found = False
+    for i in range(20):
+        rw, rt = _find_captcha_tab()
+        if rw > 0:
+            check_js = '''
+            try {
+                var canvas = document.getElementById('captcha_canvas');
+                var popup = document.querySelector('[ng-click*="popupCaptcha.auth"]');
+                document.getElementById('__mr').setAttribute('data-r',
+                    (canvas && canvas.width > 0) || popup ? 'captcha_found' : 'no_captcha');
+            } catch(e) {
+                document.getElementById('__mr').setAttribute('data-r', 'no_captcha');
+            }
+            '''
+            has_captcha = run_page_js(check_js, rw, rt)
+            if has_captcha == 'captcha_found':
+                captcha_found = True
+                break
+        time.sleep(0.1)
+        if not captcha_found and i >= 5:
+            break
+    if captcha_found:
+        print("  보안문자 발견! 자동 풀기 시도...")
+        for cap_attempt in range(3):
+            if solve_captcha():
+                break
+            print(f"  캡차 재시도 {cap_attempt+1}...")
+            time.sleep(1)
         else:
-            print("  보안문자 없음, 계속 진행")
+            print("  캡차 자동 풀기 실패. 수동으로 입력하세요.")
+            input("  입력 후 Enter...")
+    else:
+        print("  보안문자 없음, 계속 진행")
 
     print("\n" + "=" * 50)
     print("  Phase 2: 등급/구역 선택")
@@ -1124,7 +1107,7 @@ def run_full(skip_wait=False):
         if has and int(has) > 0:
             break
         time.sleep(0.05)
-    time.sleep(0.3)
+    time.sleep(0.1)
 
     # 캔버스 위치 캐싱 (Chrome은 이미 활성 상태)
     cached_canvas = _get_canvas_region() or region
